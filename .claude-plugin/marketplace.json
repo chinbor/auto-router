@@ -1,0 +1,16 @@
+{
+  "name": "auto-router",
+  "owner": {
+    "name": "chinbor"
+  },
+  "metadata": {
+    "description": "auto-router: route each prompt to a fitting Claude model and hand side tasks to the pi agent"
+  },
+  "plugins": [
+    {
+      "name": "auto-router",
+      "source": "./",
+      "description": "Switch Claude models per prompt, dispatch tasks to the pi agent, guard against context-heavy reads, and measure it all with per-session A/B tests"
+    }
+  ]
+}

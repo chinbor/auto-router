@@ -1,0 +1,25 @@
+{
+  "name": "auto-router",
+  "version": "0.2.0",
+  "description": "按问题自动切换 Claude 模型，把适合的任务派给 pi agent（GPT / DeepSeek / Agnes），拦大读取、提醒交接来省额度，并用对照实验衡量效果",
+  "author": {
+    "name": "chinbor",
+    "url": "https://github.com/chinbor"
+  },
+  "homepage": "https://github.com/chinbor/auto-router",
+  "repository": "https://github.com/chinbor/auto-router",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "keywords": [
+    "router",
+    "model",
+    "pi",
+    "agent",
+    "gpt",
+    "deepseek",
+    "agnes",
+    "token",
+    "quota",
+    "experiment"
+  ]
+}
