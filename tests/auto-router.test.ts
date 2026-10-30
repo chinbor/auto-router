@@ -3,6 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import { buildRoles, chainFor, DEFAULT_CONFIG, earliestRun, isPeak, liveChain, nextOffPeak, sticky } from '../hooks/config'
 import { summarize } from '../hooks/stats'
+import { piStatus, routeStatus } from '../hooks/statusline'
 import type { LogRecord } from '../hooks/stats'
 import type { Config } from '../hooks/config'
 
@@ -481,4 +482,19 @@ test('质量防护：上下文超过阈值时不降档', async ($, on) => {
   let hit
   for (let i = 0; i < 20 && !hit; i++) hit = await ui.find({ type: 'Text', text: /上一个问题：闲聊\/简答 → opus/ })
   expect(hit).toBeDefined()
+})
+
+test('状态行：颜色圆点标模型，图标标类别、降档缓冲、防护和外派', () => {
+  const base = { label: '小改动/查找', model: 'sonnet', lighterStreak: 0 }
+  const o = { downgradeAfter: 2, showPi: true }
+  expect(routeStatus(base, o)).toBe('🔵 Sonnet  ·  🔍 小改动/查找')
+  expect(routeStatus(base, { ...o, prevModel: 'claude-haiku-5-5' })).toContain('⬆ 自 🟢 Haiku')
+  expect(routeStatus({ ...base, label: '闲聊/简答', model: 'opus', wanted: 'haiku', lighterStreak: 1 }, o)).toContain('⏳ 想降到 🟢 Haiku（1/2）')
+  expect(routeStatus({ ...base, model: 'opus', why: '上下文 316K，不降档' }, o)).toContain('🔒 上下文 316K')
+  expect(routeStatus({ ...base, model: 'opus', why: '你在纠正上一轮，升一档' }, o)).toContain('⬆ 你在纠正')
+  expect(routeStatus({ ...base, label: '评审/查根因', model: 'opus', piRole: 'review' }, o)).toContain('🚀 可派 pi（评审）')
+  expect(routeStatus({ ...base, piRole: 'review' }, { ...o, showPi: false })).not.toContain('🚀')
+  expect(routeStatus({ ...base, control: true }, o)).toBe('🧪 对照日  ·  不切换  ·  本来会用 🔵 Sonnet')
+  expect(routeStatus({ label: '固定', model: 'haiku', lighterStreak: 0 }, o)).toBe('📌 固定  ·  🟢 Haiku')
+  expect(piStatus('review', 'openai/gpt-6.1-sol')).toBe('🚀 pi  ·  评审  ·  gpt-6.1-sol 运行中')
 })

@@ -19,6 +19,7 @@ import { checkTool, firstTime, rulesText } from './saver'
 import { experimentReport, family, reportText } from './stats'
 import { decide, probeClassifier } from './classify'
 import { renderPane } from './panel'
+import { piStatus, routeStatus } from './statusline'
 import { armLabel, armOf, clock, config, editConfig, guardSeen, imgCheck, logDir, logRecord, piArgv, readLogs, refreshPiModels, registerTools, resetSession, rt, saverHints, saverOn, sessionTags, userEnv } from './core'
 
 // auto-router 的入口：把各模块接到引擎事件上。
@@ -167,7 +168,7 @@ async function runChain(
 ): Promise<PiJob> {
   job = { ...job, status: 'running', startedAt: Date.now(), model: chain[0] ?? job.model }
   await saveJob($, job)
-  $.ui.status(`pi: ${job.model} 运行中`)
+  $.ui.status(piStatus(job.role, job.model))
 
   const env = await userEnv($)
   for (const model of chain) {
@@ -391,18 +392,14 @@ export const register: Register = on => {
 
     const decision: RouterDecision | null = mode === 'auto' ? await read($, lastDecision) : { label: '固定', model: mode, lighterStreak: 0 }
     if (decision?.control) {
-      if (e.index === 0) $.ui.status(`对照日：不切换（本来会选 ${decision.model ?? '不变'}）`)
+      if (e.index === 0) $.ui.status(routeStatus(decision, { downgradeAfter: 2, showPi: false }))
       return yield* next(e)
     }
     const model = decision?.model
     if (!decision || !model || !/claude|opus|sonnet|haiku|fable/i.test(e.model)) return yield* next(e)
     if (e.index === 0) {
-      const held = decision.why
-        ? `，${decision.why}`
-        : decision.wanted && decision.wanted !== model
-          ? `，想降到 ${decision.wanted}，再判 ${decision.lighterStreak} 次轻类别后降`
-          : ''
-      $.ui.status(`模型: ${model}（${decision.label}${held}）`)
+      const cfg = await config($)
+      $.ui.status(routeStatus(decision, { prevModel: lastMainModel, downgradeAfter: cfg.claude.downgradeAfter, showPi: await read($, piAuto) }))
     }
     return yield* next({ ...e, model })
   })
