@@ -152,7 +152,7 @@ test('classify 正常时不 fork', async ($, on) => {
   await submit($, '实现登录功能')
   await complete($)
   expect(forkCalls).toBe(0)
-  expect(logRows(h)[0]).toMatchObject({ cat: '编码', via: 'classify', pick: 'opus' })
+  expect(logRows(h)[0]).toMatchObject({ cat: '编码', via: 'classify', pick: 'sonnet' })
 })
 
 test('两条路都失败时如实记下原因，不切换模型', async ($, on) => {
@@ -188,7 +188,7 @@ test('已在 Opus 且上下文长到不降档时不 fork：分类结果改变不
   const h = harness(on, { cfg: DEFAULT_CONFIG, ctx: 200_000 })
   let classifyCalls = 0
   let forkCalls = 0
-  on('model.classify', () => (++classifyCalls === 1 ? { value: DEFAULT_CONFIG.claude.categories[3]?.label } : { deny: RATE_LIMITED }))
+  on('model.classify', () => (++classifyCalls === 1 ? { value: DEFAULT_CONFIG.claude.categories[4]?.label } : { deny: RATE_LIMITED }))
   on('model.fork', () => {
     forkCalls++
     return { value: { isAnswered: true, text: '1', usage: USAGE } }
@@ -204,7 +204,7 @@ test('已在 Opus 且上下文长到不降档时不 fork：分类结果改变不
   expect(forkCalls).toBe(0)
   expect(classifyCalls).toBe(2)
   const rows = logRows(h)
-  expect(rows[0]).toMatchObject({ cat: '编码', pick: 'opus' })
+  expect(rows[0]).toMatchObject({ cat: '难题/设计', pick: 'opus' })
   expect(rows[1]).toMatchObject({ cf: 'error', pick: 'opus' })
   expect(rows[2]).toMatchObject({ cat: '跳过（换不了模型）', cf: 'skip', pick: 'opus' })
 })

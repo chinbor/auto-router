@@ -1,7 +1,7 @@
 ---
 name: executor
 description: 按主会话写好的任务清单逐条执行（批量改文件、跑命令、批量生成图片视频）。只在清单写死了每一步的具体命令或改法、验收标准和停止条件时使用；需要判断、取舍或创意的活不要交给它。
-model: sonnet
+model: haiku
 tools: Bash, PowerShell, Read, Edit, Write, Glob, Grep
 ---
 

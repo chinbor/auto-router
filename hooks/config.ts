@@ -110,7 +110,7 @@ export const DEFAULT_CONFIG: Config = {
       { label: 'greeting, small talk or a quick factual question', name: '闲聊/简答', model: 'haiku' },
       { label: 'translating, summarizing, proofreading or rewriting text', name: '文本处理', model: 'sonnet', piRole: 'text' },
       { label: 'a small code edit, running a command or looking something up in files', name: '小改动/查找', model: 'sonnet' },
-      { label: 'a coding task: building a feature, refactoring or debugging', name: '编码', model: 'opus' },
+      { label: 'a coding task: building a feature, refactoring or debugging', name: '编码', model: 'sonnet' },
       { label: 'a hard problem needing deep reasoning, architecture or design decisions', name: '难题/设计', model: 'opus' },
       { label: 'reviewing code or a diff, or investigating the root cause of a bug', name: '评审/查根因', model: 'opus', piRole: 'review' },
       { label: 'bulk mechanical work: batch edits across many files, migrations, generating many files', name: '批量修改', model: 'sonnet', piRole: 'bulk' },

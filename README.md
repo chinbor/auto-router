@@ -70,7 +70,7 @@ flowchart LR
 | 闲聊、简答 | haiku | |
 | 翻译、总结、润色 | sonnet | text |
 | 小改动、跑命令、查文件 | sonnet | |
-| 编码（功能、重构、调试） | opus | |
+| 编码（功能、重构、调试） | sonnet | |
 | 难题、架构设计 | opus | |
 | 评审、查根因 | opus | review |
 | 跨多文件的批量修改 | sonnet | bulk |

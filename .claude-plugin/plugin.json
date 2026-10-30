@@ -1,6 +1,6 @@
 {
   "name": "auto-router",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "按问题自动切换 Claude 模型，把适合的任务派给 pi agent（GPT / DeepSeek / Agnes），拦大读取、提醒交接来省额度，并用对照实验衡量效果",
   "author": {
     "name": "chinbor",
