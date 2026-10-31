@@ -4,7 +4,7 @@ import type { EngineInterface } from 'claude-code'
 import type { ModelMode, SettingsTab } from '../types'
 import { buildRoles, chainFor, isPeak, providerOf, setPath } from './config'
 import type { Config, Tier } from './config'
-import { experimentReport, summarize, verdict } from './stats'
+import { experimentReport, modelVersions, summarize, verdict, versionLabel } from './stats'
 import type { Arm } from './stats'
 import { armLabel, clock, config, editConfig, logDir, readLogs, refreshPiModels, sessionTags } from './core'
 
@@ -153,12 +153,16 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     const mode = await read($, modelMode)
     const more = await read($, showMore)
     const suggest = await read($, piAuto)
+    // 版本号取这台机器最近实际用到的模型 id：别名会随 Claude Code 指向新版，写死会过时
+    const vers = modelVersions(await readLogs($, Date.now() - 14 * 86_400_000))
+    const V = (a: 'haiku' | 'sonnet' | 'opus') => versionLabel(a, vers[a])
     const MODEL_OPTS = [
-      { value: 'haiku', label: 'Haiku' },
-      { value: 'sonnet', label: 'Sonnet' },
-      { value: 'opus', label: 'Opus' },
+      { value: 'haiku', label: V('haiku') },
+      { value: 'sonnet', label: V('sonnet') },
+      { value: 'opus', label: V('opus') },
       { value: '-', label: '不变' },
     ]
+    const verNote = (['haiku', 'sonnet', 'opus'] as const).map(a => vers[a]).filter(Boolean).join(' / ')
     body = (
       <Box flexDirection="column">
         {intro('每次提问先判断属于哪一类，再决定这一轮用哪个 Claude 模型。简单的用小模型，省 Claude 额度。')}
@@ -170,9 +174,9 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             options: [
               { value: 'auto', label: '自动' },
               { value: 'off', label: '不切换' },
-              { value: 'haiku', label: '固定 Haiku' },
-              { value: 'sonnet', label: '固定 Sonnet' },
-              { value: 'opus', label: '固定 Opus' },
+              { value: 'haiku', label: `固定 ${V('haiku')}` },
+              { value: 'sonnet', label: `固定 ${V('sonnet')}` },
+              { value: 'opus', label: `固定 ${V('opus')}` },
             ],
             onSelect: v => void update($, modelMode, () => v as ModelMode),
           }),
@@ -195,11 +199,17 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                   })}
                   {cat.piRole && (
                     <Text dimColor size="footnote">
-                      ↳ 提醒派给 pi（{roleName(cat.piRole)}）
+                      ↳ 也可派给 pi（{roleName(cat.piRole)}）
                     </Text>
                   )}
                 </Box>
               ))}
+              <Text dimColor size="footnote">
+                这一轮由左边的 Claude 模型回答；“也可派给 pi”是提醒 Claude 把能写成清单的部分交给 pi 做，结果仍由 Claude 验收。
+              </Text>
+              <Text dimColor size="footnote">
+                {verNote ? `版本按这台机器最近实际用到的：${verNote}` : '版本号会在用过一次后显示（取实际调用到的模型）'}
+              </Text>
             </Box>,
           )}
         <Box marginBottom={1}>

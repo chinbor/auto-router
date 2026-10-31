@@ -16,7 +16,7 @@ import {
 import type { BigRead } from './saver'
 import type { Config } from './config'
 import { checkTool, firstTime, rulesText } from './saver'
-import { experimentReport, family, reportText } from './stats'
+import { categoryStats, categoryText, experimentReport, family, reportText, summarize } from './stats'
 import { decide, probeClassifier } from './classify'
 import { renderPane } from './panel'
 import { piStatus, routeStatus } from './statusline'
@@ -276,11 +276,42 @@ async function startJob(
 
 // ---------- router_config 工具 ----------
 
-type ConfigInput = { action?: 'get' | 'set' | 'reset' | 'probe'; path?: string; value?: unknown; remove?: boolean }
+type ConfigInput = { action?: 'get' | 'set' | 'reset' | 'probe' | 'report'; path?: string; value?: unknown; remove?: boolean; days?: number }
+
+/** 给定时任务这类不能敲斜杠命令的场合用：对照实验、按类别、整体汇总放在一起 */
+async function effectReport($: EngineInterface, days: number): Promise<string> {
+  const from = Date.now() - days * 86_400_000
+  const logs = await readLogs($, from)
+  const cfg = await config($)
+  const s = summarize(logs, from)
+  const overall = {
+    experiment: cfg.experiment,
+    arms: s.arms,
+    savedUsdEstimate: s.savedUsd,
+    cheapUsd: s.cheapUsd,
+    pi: s.pi,
+    weekQuotaPct: s.week,
+    guards: logs.filter(r => r.t === 'guard' && !r.again).length,
+    guardsReleased: logs.filter(r => r.t === 'guard' && r.again).length,
+  }
+  return [
+    `# auto-router 效果（最近 ${days} 天）`,
+    '',
+    '## 对照实验',
+    reportText(experimentReport(logs, from), days),
+    '',
+    '## 按类别（纠正记在被纠正的那一轮）',
+    categoryText(categoryStats(logs, from)),
+    '',
+    '## 整体汇总（JSON）',
+    JSON.stringify(overall, null, 2),
+  ].join('\n')
+}
 
 async function configTool($: EngineInterface, input: ConfigInput): Promise<string> {
   const path = await configPath($, rt.isWindows)
   if (input.action === 'probe') return probeClassifier($)
+  if (input.action === 'report') return effectReport($, Math.max(1, Math.min(90, Number(input.days) || 7)))
   if (input.action === 'reset') {
     const old = await config($)
     await $.fs.write(`${path}.bak`, JSON.stringify(old, null, 2) + '\n')
@@ -342,12 +373,13 @@ export const register: Register = on => {
       isDeferred: true,
       description:
         "Read or change the auto-router config (which Claude model each kind of prompt gets, which pi models each role tries in order, providers on/off, peak hours, holidays). Use it when the user asks to change routing in words. " +
-        "action=get returns the config JSON and the pi models available; action=set changes one value by a dotted path (e.g. path 'pi.roles.code.models', value ['openai/gpt-6.1-sol','openai/gpt-6.1-terra']; path 'pi.providers.openai.enabled', value false; path 'pi.providers.cc-switch-deep-seek.peak.holidays', value [...dates]); remove=true deletes the key; action=reset restores defaults with a .bak backup; action=probe tries each way of classifying a prompt (classify, complete, fork) and reports which work and how long they take, for when routing seems stuck. " +
+        "action=get returns the config JSON and the pi models available; action=set changes one value by a dotted path (e.g. path 'pi.roles.code.models', value ['openai/gpt-6.1-sol','openai/gpt-6.1-terra']; path 'pi.providers.openai.enabled', value false; path 'pi.providers.cc-switch-deep-seek.peak.holidays', value [...dates]); remove=true deletes the key; action=reset restores defaults with a .bak backup; action=report (optional days, default 7) returns the effect report: experiment arms, per-category turns/corrections/cost, pi jobs and guard counts; action=probe tries each way of classifying a prompt (classify, complete, fork) and reports which work and how long they take, for when routing seems stuck. " +
         'Every change is validated before it is saved; read first with get, and set whole arrays.',
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['get', 'set', 'reset', 'probe'] },
+          action: { type: 'string', enum: ['get', 'set', 'reset', 'probe', 'report'] },
+          days: { type: 'number' },
           path: { type: 'string' },
           value: {},
           remove: { type: 'boolean' },

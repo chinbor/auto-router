@@ -5,7 +5,8 @@ import { DEFAULT_CONFIG } from '../hooks/config'
 import type { Config } from '../hooks/config'
 import { pickByNumber } from '../hooks/classify'
 import { imageDims } from '../hooks/saver'
-import { sessionArms } from '../hooks/stats'
+import { categoryStats, categoryText, modelVersions, sessionArms, versionLabel } from '../hooks/stats'
+import type { LogRecord } from '../hooks/stats'
 
 type On = Parameters<TestBody>[1]
 
@@ -475,4 +476,34 @@ test('/auto-router eval：带本会话分组和报告', async ($, on) => {
   expect(text).toContain('本会话：省额度开')
   expect(text).toContain('【省额度】样本还不够')
   expect(text).toContain('6 个会话')
+})
+
+test('按类别统计：纠正记在被纠正的上一轮，按切换组分开，子代理不算', () => {
+  const t = (ts: number, sid: string, cat: string, over: Record<string, unknown> = {}): LogRecord =>
+    ({ t: 'turn', ts, sid, ra: 'auto', arm: 'auto', cat, model: 'claude-sonnet-5-5', in: 0, cw: 0, cr: 0, out: 0, usd: 0.1, ...over }) as LogRecord
+  const rows = categoryStats(
+    [
+      t(1, 'a', '编码'),
+      t(2, 'a', '闲聊/简答', { fix: true }),
+      t(3, 'a', '编码', { sub: true }),
+      t(1, 'b', '编码', { ra: 'control', model: 'claude-opus-5-5' }),
+      t(0, 'a', '编码'),
+    ],
+    1,
+  )
+  const coding = rows.find(r => r.cat === '编码' && r.ra === 'auto')
+  expect(coding).toMatchObject({ turns: 1, fixes: 1, models: { sonnet: 1 } })
+  expect(rows.find(r => r.cat === '闲聊/简答')?.fixes).toBe(0)
+  expect(rows.find(r => r.ra === 'control')).toMatchObject({ cat: '编码', turns: 1, models: { opus: 1 } })
+  expect(categoryText(rows)).toContain('样本不足')
+  expect(categoryText([])).toContain('还没有记录')
+})
+
+test('版本号：取各档最近一次实际用到的模型 id', () => {
+  const t = (ts: number, model: string) => ({ t: 'turn', ts, arm: 'auto', model, in: 0, cw: 0, cr: 0, out: 0 }) as LogRecord
+  const v = modelVersions([t(1, 'claude-opus-5-1'), t(2, 'claude-opus-5-5'), t(1, 'claude-haiku-5-5'), t(3, 'gpt-x')])
+  expect(v).toEqual({ opus: 'claude-opus-5-5', haiku: 'claude-haiku-5-5' })
+  expect(versionLabel('opus', v.opus)).toBe('Opus 5.5')
+  expect(versionLabel('sonnet', v.sonnet)).toBe('Sonnet')
+  expect(versionLabel('opus', 'claude-opus-5-5[1m]')).toBe('Opus 5.5')
 })

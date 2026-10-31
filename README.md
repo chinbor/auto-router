@@ -39,6 +39,7 @@ flowchart LR
 | [使用说明与操作清单](docs/usage.md) | 安装、首次配置、每项能力怎么触发、命令速查、排查 |
 | [架构与工作原理](docs/architecture.md) | 模块结构、钩子流程、分类和 fork 兜底、省额度、pi 外派、日志字段、引擎约束 |
 | [对照实验设计](docs/experiment.md) | 分组方法、指标、统计方法、局限、怎么跑实验 |
+| `scripts/token_report.py` | 全机 token 趋势统计脚本（读 ~/.claude/projects，对比基线），周报用 |
 | [优化方案与待办](docs/roadmap.md) | 接下来要做的优化，按优先级排好 |
 | [更新记录](CHANGELOG.md) | 版本变化 |
 | [参与开发](CONTRIBUTING.md) | 检查命令、测试写法、代码风格 |

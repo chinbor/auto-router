@@ -420,3 +420,68 @@ export function reportText(rep: ExperimentReport, days: number): string {
   lines.push('花费是按 API 价折算的美元，订阅不按它扣额度，但组间比例可以参考；两组做的活不一样时，差异也可能来自任务本身。')
   return lines.join('\n')
 }
+
+// ---------- 按类别 ----------
+
+export type CategoryRow = { cat: string; ra: 'auto' | 'control' | '-'; turns: number; fixes: number; usd: number; models: Partial<Record<string, number>> }
+
+/**
+ * 每类问题的轮数、花费、被纠正次数，按模型切换组分开。
+ * 纠正记在上一轮的类别上：用户说"不对"是在下一轮，被纠正的是上一轮的回答。
+ */
+export function categoryStats(records: LogRecord[], from: number): CategoryRow[] {
+  const bySid = new Map<string, TurnRecord[]>()
+  for (const r of records) {
+    if (r.t !== 'turn' || r.sub || r.ts < from) continue
+    const k = r.sid ?? ''
+    bySid.set(k, [...(bySid.get(k) ?? []), r])
+  }
+  const rows = new Map<string, CategoryRow>()
+  for (const turns of bySid.values()) {
+    turns.sort((a, b) => a.ts - b.ts)
+    turns.forEach((r, i) => {
+      if (!r.cat) return
+      const ra = r.ra ?? '-'
+      const k = `${r.cat}|${ra}`
+      const row = rows.get(k) ?? { cat: r.cat, ra, turns: 0, fixes: 0, usd: 0, models: {} }
+      row.turns++
+      row.usd += r.usd ?? 0
+      const f = family(r.model)
+      row.models[f] = (row.models[f] ?? 0) + 1
+      if (turns[i + 1]?.fix) row.fixes++
+      rows.set(k, row)
+    })
+  }
+  return [...rows.values()].sort((a, b) => b.turns - a.turns)
+}
+
+export function categoryText(rows: CategoryRow[]): string {
+  if (!rows.length) return '按类别：还没有记录。'
+  const lines = rows.map(r => {
+    const mix = Object.entries(r.models).map(([m, n]) => `${m} ${n}`).join(' / ')
+    const rate = r.turns >= 20 ? `${((r.fixes / r.turns) * 100).toFixed(0)}%` : '样本不足'
+    return `| ${r.cat} | ${r.ra} | ${r.turns} | ${r.fixes} | ${rate} | $${r.usd.toFixed(2)} | ${mix} |`
+  })
+  return ['| 类别 | 切换组 | 轮数 | 被纠正 | 纠正率 | 花费 | 实际模型 |', '|---|---|---|---|---|---|---|', ...lines].join('\n')
+}
+
+// ---------- 实际版本 ----------
+
+/** 各档别名最近一次实际用到的模型 id（API 报告的），面板据此显示版本号 */
+export function modelVersions(records: LogRecord[]): Partial<Record<'haiku' | 'sonnet' | 'opus', string>> {
+  const out: Partial<Record<'haiku' | 'sonnet' | 'opus', { id: string; ts: number }>> = {}
+  for (const r of records) {
+    if (r.t !== 'turn') continue
+    const f = family(r.model)
+    if (f === 'other') continue
+    if (!out[f] || r.ts > (out[f]?.ts ?? 0)) out[f] = { id: r.model, ts: r.ts }
+  }
+  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v?.id])) as Partial<Record<'haiku' | 'sonnet' | 'opus', string>>
+}
+
+/** 'haiku' + 'claude-haiku-5-5' → 'Haiku 5.5'；没见过实际 id 时只显示档名 */
+export function versionLabel(alias: string, id?: string): string {
+  const name = alias.charAt(0).toUpperCase() + alias.slice(1)
+  const m = id ? /-(\d+)-(\d+)(?:-|$|\[)/.exec(id) : null
+  return m ? `${name} ${m[1]}.${m[2]}` : name
+}

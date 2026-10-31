@@ -8,7 +8,7 @@
 
 ### P1：让结论更快、更可信
 
-- [ ] **1. 对照报告按类别拆开**
+- [~] **1. 对照报告按类别拆开**（0.2.3 已在 `router_config report` 里出表；面板“效果”页和 `/auto-router eval` 还没加）
   - 现状：`stats.ts` 的 `sessionStats` / `experimentReport` 只按会话和组汇总，`summarize` 只按组和模型计数，看不出某一类问题的纠正率。
   - 做法：
     - 新增 `categoryStats(records, from)`：按 `cat` 统计每类的轮数、花费、纠正次数和纠正率，再按组（`ra`）分开。
