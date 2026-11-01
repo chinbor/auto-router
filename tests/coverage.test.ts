@@ -450,10 +450,10 @@ for (const surface of ['mobile', 'desktop'] as const) {
     await pick('bigread', 'pi')
     for (let i = 0; i < 30 && cfg().saver.bigRead !== 'pi'; i++) await ui.findAll({})
     expect(cfg().saver.bigRead).toBe('pi')
-    await ui.press({ key: 'guard' })
+    await pick('guard', 'off')
     for (let i = 0; i < 30 && cfg().saver.guard; i++) await ui.findAll({})
     expect(cfg().saver.guard).toBe(false)
-    await ui.press({ key: 'saver' })
+    await pick('saver', 'off')
     for (let i = 0; i < 30 && cfg().saver.enabled; i++) await ui.findAll({})
     expect(cfg().saver.enabled).toBe(false)
     await ui.unmount()
@@ -467,7 +467,8 @@ test('/auto-router eval：带本会话分组和报告', async ($, on) => {
   const rows: string[] = []
   for (let s = 0; s < 3; s++)
     for (const sv of ['on', 'off'])
-      rows.push(JSON.stringify({ t: 'turn', ts: now - 1000, arm: 'auto', model: 'claude-opus-5-5', in: 1, cw: 0, cr: 0, out: 1, usd: sv === 'on' ? 0.1 : 0.2, sid: `${sv}${s}`, ex: 'saver', sv }))
+      for (let i = 0; i < 3; i++)
+        rows.push(JSON.stringify({ t: 'turn', ts: now - 1000 + i, arm: 'auto', model: 'claude-opus-5-5', in: 1, cw: 0, cr: 0, out: 1, usd: sv === 'on' ? 0.1 : 0.2, sid: `${sv}${s}`, ex: 'saver', sv }))
   h.files['LOG\\2026-10-30_older.jsonl'] = rows.join('\n') + '\n'
   on('command.run', (_, e) => ({ text: e.args }))
   await start($)

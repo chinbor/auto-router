@@ -18,8 +18,8 @@ description: 要把活交出去之前用：判断该自己做、交给 scout / e
 |---|---|---|
 | 读不到约 3 万 token 的材料 | 自己读 | — |
 | 读 3 万–20 万 token；要上网、要 MCP 工具，或含不该发给第三方的私密内容 | `auto-router:scout` | Claude（Sonnet） |
-| 读超过约 20 万 token，或 7 天额度已用过阈值（默认 70%），材料都在本机 | `pi_dispatch` role=longctx | DeepSeek 按量（高峰时段排队） |
-| 写死了每一步的批量机械执行 | pi role=bulk / code（要 git 干净），pi 不可用时 `auto-router:executor` | pi 订阅；executor 占 Claude |
+| 读超过约 20 万 token，或 7 天额度已用过阈值（默认 70%），材料都在本机 | `pi_dispatch` role=longctx | 先试 opencode 免费的 DeepSeek-v4.1，再试 pi 的 DeepSeek 按量（高峰时段排队） |
+| 写死了每一步的批量机械执行 | `pi_dispatch` role=bulk / code（要 git 干净），都不可用时 `auto-router:executor` | pi 订阅或 opencode 免费；executor 占 Claude |
 
 `saver.bigRead` 设成 scout 或 pi 时，大量阅读固定交给那一边。
 

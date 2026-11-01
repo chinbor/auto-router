@@ -117,6 +117,21 @@ test('拦大文件：第一次拒绝并给出读法，原样再请求放行', as
   expect(reached).toBe(2)
 })
 
+test('isInteractive=false 也照常入组（桌面 app 和重载后它会误报），短会话靠报告里的轮数门槛去掉', async ($, on) => {
+  const cfg: Config = { ...DEFAULT_CONFIG, experiment: 'saver' }
+  base(on, cfg, sidFor('off'))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 300 * 1024, mtimeMs: 0, isLink: false } }))
+  let reached = 0
+  on('tool.call', () => {
+    reached++
+    return { result: 'file text' }
+  })
+  await $.session.start({ cwd: 'D:\\work', surface: 'desktop', isInteractive: false })
+  // 分到“关”的 id：照常入组，不拦
+  await $.tool.call({ tool: 'Read', file_path: 'D:\\work\\big.log' })
+  expect(reached).toBe(1)
+})
+
 test('省额度规则写进系统提示；实验里分到“关”的会话不写', async ($, on) => {
   const cfg: Config = { ...DEFAULT_CONFIG, experiment: 'saver' }
   base(on, cfg, sidFor('on'))
@@ -163,16 +178,46 @@ test('评测报告 fork 分类在切换组花费里的占比：fork 按上一轮
   const rows: LogRecord[] = [
     mk('a1', 'auto', 0, 'claude-opus-5-5'),
     mk('a1', 'auto', 1, 'claude-sonnet-5-5', [0, 10_000, 0, 0]),
+    mk('a1', 'auto', 2, 'claude-sonnet-5-5'),
     mk('c1', 'control', 0, 'claude-opus-5-5'),
     mk('c1', 'control', 1, 'claude-opus-5-5'),
+    mk('c1', 'control', 2, 'claude-opus-5-5'),
   ]
   const price = unitPrices(rows as TurnRecord[])
   // 第二轮的 fork 发生在切换前，按 opus 计价：缓存读 1 万是一轮 opus（10 万）的十分之一
   expect(Math.abs(forkUsd([0, 10_000, 0, 0], 'claude-opus-5-5', price) - 0.005)).toBeLessThan(1e-9)
   const rep = experimentReport(rows, 0)
   const ef = rep.effects.find(e => e.factor === 'route')
-  expect(Math.abs((ef?.on.usd ?? 0) - 0.08)).toBeLessThan(1e-9)
-  expect(Math.abs((ef?.on.forkShare ?? 0) - 0.005 / 0.08)).toBeLessThan(1e-9)
+  expect(Math.abs((ef?.on.usd ?? 0) - 0.11)).toBeLessThan(1e-9)
+  expect(Math.abs((ef?.on.forkShare ?? 0) - 0.005 / 0.11)).toBeLessThan(1e-9)
   expect(ef?.off.forkShare).toBe(0)
-  expect(reportText(rep, 7)).toContain('fork 分类约占切换组花费的 6%')
+  expect(reportText(rep, 7)).toContain('fork 分类约占切换组花费的 5%')
+})
+
+test('实验报告：不到 3 轮的会话不算；和别的会话同时开的不算额度涨幅；外派次数单列', () => {
+  const t = (sid: string, sv: 'on' | 'off', ts: number, wk: number): TurnRecord => ({
+    t: 'turn', ts, arm: 'auto', model: 'claude-opus-5-5', in: 0, cw: 0, cr: 0, out: 0, usd: 0.1, wk, sid, ex: 'saver', sv,
+  })
+  const rows: LogRecord[] = []
+  // on1 单独开（额度 10 → 14），on2 和不在实验里的 x1 同时开（额度 20 → 30，混着 x1 的消耗）
+  for (let i = 0; i < 3; i++) rows.push(t('on1', 'on', 100 + i, 10 + 2 * i))
+  for (let i = 0; i < 3; i++) rows.push(t('on2', 'on', 200 + i, 20 + 5 * i))
+  const { ex: _ex, sv: _sv, ...outside } = t('x1', 'on', 201, 25)
+  rows.push(outside)
+  for (let i = 0; i < 3; i++) rows.push(t('off1', 'off', 300 + i, 40 + i))
+  rows.push(t('short', 'off', 400, 50), t('short', 'off', 401, 51))
+  rows.push({ t: 'pi', ts: 101, role: 'text', model: 'agnes/agnes-3.0-flash', ok: true, ms: 1000, sid: 'on1', ex: 'saver', sv: 'on' })
+  const rep = experimentReport(rows, 0)
+  const ef = rep.effects.find(e => e.factor === 'saver')
+  expect({ short: rep.short, off: ef?.off.sessions, wkSessions: ef?.on.wkSessions, wk: ef?.on.wkPerSession, pi: ef?.on.piJobs }).toEqual({
+    short: 1,
+    off: 1,
+    wkSessions: 1,
+    wk: 4,
+    pi: 1,
+  })
+  const text = reportText(rep, 7)
+  expect(text).toContain('另有 1 个不到 3 轮的没算')
+  expect(text).toContain('外派       1 / 0 次')
+  expect(text).toContain('还差 14 个')
 })

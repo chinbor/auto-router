@@ -1,6 +1,8 @@
-/** 派给 pi 的一个任务，pane 里一行 */
+/** 外派出去的一个任务（pi 或 opencode），pane 里一行 */
 export type PiJob = {
   id: string
+  /** 走哪个通道；旧记录没有，按模型前缀推断（opencode/ 开头是 opencode） */
+  channel?: 'pi' | 'opencode'
   /** 配置里的角色名，如 code / bulk / text；手动指定模型时为 custom */
   role: string
   /** 实际跑成功（或最后尝试）的模型 */
@@ -16,7 +18,7 @@ export type PiJob = {
   tail: string
   /** 降级过程，如 "agnes/agnes-3.0-flash: No API key" */
   notes: string[]
-  /** 禁用了 pi 的 edit / write / bash */
+  /** 禁用了 edit / write / bash */
   readOnly?: boolean
   /** 会写文件的任务跑完后的改动摘要（git status + diff --stat） */
   changes?: string
@@ -76,10 +78,16 @@ declare module 'claude-code' {
       configRev: number
       /** `pi --list-models` 里能用的模型，provider/id */
       piModels: Shaped<string[]>
+      /** `opencode models opencode` 里此刻还在的免费模型 */
+      ocModels: Shaped<string[]>
       /** 因鉴权 / 额度错误被暂停的提供商：暂停到何时、为什么 */
       paused: Shaped<Record<string, { until: number; reason: string }>>
       /** pi 模型页显示全部模型的提供商 */
       setupOpen: string | null
+      /** 外派模型页正在确认“按档位重排” */
+      rebuildAsk: boolean
+      /** 外派模型页展开高级设置 */
+      advOpen: boolean
       /** 效果页统计最近几天 */
       statsDays: number
     }

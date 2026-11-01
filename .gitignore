@@ -2,3 +2,5 @@
 .mcpb-cache/
 *.log
 .DS_Store
+bench-results*.json
+__pycache__/

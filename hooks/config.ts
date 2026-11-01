@@ -27,10 +27,15 @@ export type PeakSchedule = {
   holidays: string[]
 }
 
+/** free 免费 / subscription 订阅 / token 按量付费；同一档里按这个顺序排 */
+export type Billing = 'free' | 'subscription' | 'token'
+
+/** 外派通道：opencode/ 开头的模型走 opencode run，其余走 pi */
+export type Channel = 'pi' | 'opencode'
+
 export type Provider = {
   enabled: boolean
-  /** subscription 订阅 / token 按量付费，只作说明和展示 */
-  billing: 'subscription' | 'token'
+  billing: Billing
   /** 有值时，高峰时段跳过该提供商 */
   peak?: PeakSchedule
   note?: string
@@ -45,7 +50,7 @@ export type Role = {
   readOnly?: boolean
 }
 
-/** 模型档位：strong 强、mid 中、light 轻；面板 pi 模型页按档位排各角色的模型顺序 */
+/** 模型档位：strong 强、mid 中、light 轻；面板外派模型页按档位排各角色的模型顺序 */
 export type Tier = 'strong' | 'mid' | 'light'
 
 export type Config = {
@@ -71,8 +76,25 @@ export type Config = {
     fallback: string[]
     /** 提供商报鉴权 / 额度类错误后暂停多少分钟 */
     pauseMinutes: number
-    /** 模型档位，同一档里排在前面的更强；pi 模型页据此排角色 */
+    /** 模型档位，同一档里排在前面的更强；外派模型页据此排角色 */
     tiers: Record<string, Tier>
+    /** 模型擅长的角色（实测得出）：同档同计费方式里，擅长这个角色的排前面，只擅长别的角色的排后面；fallback 表示适合当兜底 */
+    strengths: Record<string, string[]>
+    /**
+     * 外派给 pi 时照样加载的扩展（~/.pi/agent/npm 里的包名）。其余扩展、MCP、技能一律不加载：
+     * 实测 pi 会带上 subagent、电脑操控、浏览器和知识库 MCP，只读任务也能借它们写东西或碰到私人数据
+     */
+    keepExtensions: string[]
+  }
+  /** opencode 通道的隐私设置（免费模型的数据政策见 docs/architecture.md） */
+  opencode: {
+    /**
+     * 允许发给 opencode 免费模型的目录。[] 表示不限目录，但 logged 里的模型一律不用；
+     * 有值时 logged 里的模型只在这些目录里用，长文阅读（longctx）也只在这些目录里用 opencode；"*" 表示全部允许
+     */
+    allowDirs: string[]
+    /** 官方说明里会记录使用或拿数据改进模型的免费模型 */
+    logged: string[]
   }
   saver: {
     /** 总开关：关掉后不拦、不提醒、不写规则，scout / executor 子代理也不出现 */
@@ -97,10 +119,19 @@ const TERRA = 'openai/gpt-6.1-terra'
 const DS_FLASH = 'cc-switch-deep-seek/deepseek-flash'
 const AG3 = 'agnes/agnes-3.0-flash'
 const AG25 = 'agnes/agnes-2.5-flash'
+// opencode 的免费模型（走 opencode run，不走 pi）
+const OC_DS = 'opencode/deepseek-v4.1-flash-free'
+const OC_GLM = 'opencode/glm-5.3-flash-free'
+const OC_MIMO = 'opencode/mimo-v2.6-flash-free'
+const OC_FLINT = 'opencode/flint-40b-free'
+const OC_VL = 'opencode/nemotron-3.5-super-vl-free'
+const OC_LIGHT = 'opencode/nemotron-3.5-lightning-free'
+const OC_BEAM = 'opencode/beam-free'
+const OC_PICKLE = 'opencode/big-pickle'
 
-// 原则：订阅（gpt、agnes）优先，按量付费的 deepseek 只作兜底，且只在空闲时段用；
-// 只有要 1M 长上下文时才首选 deepseek-flash。deepseek-v4-pro 比 flash 贵，默认不用。
-// 强度 gpt > deepseek > agnes；terra 比 sol 快、便宜，看图和操作电脑更强，sol 推理更强。
+// 原则：同一档里 免费 → 订阅 → 按量付费。opencode 免费模型兜底或打头，gpt、agnes 订阅留给重要的活，
+// 按量付费的 deepseek 尽量靠后，且只在空闲时段用。deepseek-v4-pro 比 flash 贵，默认不用。
+// 强度 gpt > deepseek ≈ 免费的中档 > agnes；terra 比 sol 快、便宜，看图和操作电脑更强，sol 推理更强。
 export const DEFAULT_CONFIG: Config = {
   claude: {
     downgradeAfter: 2,
@@ -135,51 +166,78 @@ export const DEFAULT_CONFIG: Config = {
           holidays: [],
         },
       },
+      opencode: { enabled: true, billing: 'free', note: '免费模型走 opencode run；随时可能下架，限流时整家暂停' },
     },
     roles: {
       review: {
         description: 'independent code review, root-cause diagnosis, tricky algorithms; a second opinion to check Claude against',
-        models: [SOL, TERRA, DS_FLASH],
+        models: [SOL, TERRA, OC_DS, DS_FLASH],
         readOnly: true,
       },
       code: {
         description: 'well-specified coding: implement a module, add tests, refactor to a given plan',
-        models: [TERRA, SOL, DS_FLASH],
+        models: [TERRA, SOL, OC_GLM, DS_FLASH],
       },
       vision: {
         description: 'tasks that need to look at screenshots or images, UI work',
-        models: [TERRA, SOL, DS_FLASH],
+        models: [TERRA, OC_VL, SOL],
       },
       bulk: {
         description: 'mechanical edits across many files: renames, migrations, applying one pattern everywhere',
-        models: [TERRA, AG3, DS_FLASH],
+        models: [TERRA, OC_GLM, AG3],
       },
       longctx: {
         description: 'reading a very large amount of code or documents (beyond ~200K tokens) and summarizing it',
-        models: [DS_FLASH, TERRA],
+        models: [OC_DS, DS_FLASH, TERRA],
         readOnly: true,
       },
       quick: {
         description: 'simple scripted chores: analyse logs, run tests and report, convert formats, search and tabulate',
-        models: [AG3, TERRA, DS_FLASH],
+        models: [OC_MIMO, AG3, TERRA],
       },
       text: {
         description: 'pure text: translate, summarize, rewrite, write commit messages, name things',
-        models: [AG3, AG25, DS_FLASH],
+        models: [OC_GLM, AG3, AG25],
         readOnly: true,
       },
       trivial: {
         description: 'trivial extraction or formatting: pull fields out, reshape into JSON, simple classification',
-        models: [AG25, AG3, DS_FLASH],
+        models: [OC_LIGHT, AG25, OC_BEAM],
         readOnly: true,
       },
     },
     guard: { requireCleanGit: true },
-    // gpt 退订、deepseek 高峰时，各角色最后靠 agnes-3.0-flash 顶上
-    fallback: [AG3, AG25],
+    // gpt 退订、deepseek 高峰时，各角色最后靠 agnes 订阅顶上，再不行用 opencode 免费模型
+    fallback: [AG3, AG25, OC_MIMO, OC_FLINT],
     pauseMinutes: 30,
-    tiers: { [SOL]: 'strong', [TERRA]: 'strong', [DS_FLASH]: 'mid', [AG3]: 'light', [AG25]: 'light' },
+    tiers: {
+      [SOL]: 'strong',
+      [TERRA]: 'strong',
+      [DS_FLASH]: 'mid',
+      [OC_DS]: 'mid',
+      [OC_GLM]: 'mid',
+      [OC_MIMO]: 'mid',
+      [OC_FLINT]: 'mid',
+      [OC_VL]: 'mid',
+      [AG3]: 'light',
+      [AG25]: 'light',
+      [OC_LIGHT]: 'light',
+      [OC_BEAM]: 'light',
+    },
+    strengths: {
+      [OC_DS]: ['review', 'longctx'],
+      [OC_GLM]: ['code', 'bulk', 'text'],
+      [OC_MIMO]: ['quick', 'fallback'],
+      [OC_FLINT]: ['fallback'],
+      [OC_VL]: ['vision'],
+      [OC_LIGHT]: ['trivial'],
+    },
+    // 只拦危险命令的安全扩展，装了就留着
+    keepExtensions: ['cc-safety-net'],
   },
+  // 据 opencode.ai/docs/zen（2026-11 核实）：glm-5.3-flash-free、deepseek-v4.1-flash-free 零留存、不训练；
+  // beam-free 不训练、留存 30 天；big-pickle、flint、mimo 免费期数据可能用于改进模型；nemotron 走 NVIDIA 试用端点，记录使用、要求不传私密数据
+  opencode: { allowDirs: [], logged: [OC_PICKLE, OC_FLINT, OC_MIMO, OC_VL, OC_LIGHT] },
   saver: {
     enabled: true,
     guard: true,
@@ -210,7 +268,7 @@ export async function configPath($: EngineInterface, isWindows: boolean): Promis
 let warned = false
 let created = false
 
-/** 这次运行里配置文件是不是刚生成的（新用户，面板先打开 pi 模型页）；读一次后清零 */
+/** 这次运行里配置文件是不是刚生成的（新用户，面板先打开外派模型页）；读一次后清零 */
 export function consumeCreated(): boolean {
   const was = created
   created = false
@@ -230,21 +288,66 @@ export async function loadConfig($: EngineInterface, isWindows: boolean): Promis
     // 旧版的 claude.abTest（单双号日对照）换成按会话分组的 route 实验
     const legacyAb = (raw.claude as { abTest?: boolean } | undefined)?.abTest === true
     const { abTest: _ab, ...claude } = (raw.claude ?? {}) as Partial<Config['claude']> & { abTest?: boolean }
-    const cfg: Config = {
+    const merged: Config = {
       claude: { ...DEFAULT_CONFIG.claude, ...claude },
       pi: { ...DEFAULT_CONFIG.pi, ...raw.pi },
+      opencode: { ...DEFAULT_CONFIG.opencode, ...raw.opencode },
       saver: { ...DEFAULT_CONFIG.saver, ...raw.saver },
       experiment: raw.experiment ?? (legacyAb ? 'route' : DEFAULT_CONFIG.experiment),
     }
+    const { cfg, note } = raw.pi && !raw.opencode ? migrateOpencode(merged) : { cfg: merged, note: undefined }
     const errs = validate(cfg)
     if (errs.length) throw new Error(errs.slice(0, 3).join('；'))
     warned = false
+    if (note) {
+      // 迁移只做一次：写回后文件里就有 opencode 段了；旧文件留一份 .bak
+      await $.fs.write(`${path}.bak`, JSON.stringify(raw, null, 2) + '\n').catch(() => undefined)
+      await saveConfig($, isWindows, cfg).catch(() => undefined)
+      $.ui.toast(note)
+    }
     return cfg
   } catch (err) {
     if (!warned) $.ui.toast(`auto-router 配置读取失败，先用默认值：${String(err).slice(0, 120)}`)
     warned = true
     return DEFAULT_CONFIG
   }
+}
+
+// 0.2.x 的默认角色和兜底：旧配置还是这一套（没手调过）时，迁移时直接按新档位重排
+const LEGACY_ROLES: Record<string, string[]> = {
+  review: [SOL, TERRA, DS_FLASH],
+  code: [TERRA, SOL, DS_FLASH],
+  vision: [TERRA, SOL, DS_FLASH],
+  bulk: [TERRA, AG3, DS_FLASH],
+  longctx: [DS_FLASH, TERRA],
+  quick: [AG3, TERRA, DS_FLASH],
+  text: [AG3, AG25, DS_FLASH],
+  trivial: [AG25, AG3, DS_FLASH],
+}
+const LEGACY_FALLBACK = [AG3, AG25]
+
+/**
+ * 0.2.x 的配置（没有 opencode 段）升到 0.3：加上 opencode 提供商、免费模型的档位和擅长标签；
+ * 用户已经有的提供商、档位不动。角色还是旧默认时按新档位重排，手调过的不动，只提示一句。
+ */
+export function migrateOpencode(cfg: Config): { cfg: Config; note?: string } {
+  if (cfg.pi.providers.opencode) return { cfg: { ...cfg, opencode: { ...DEFAULT_CONFIG.opencode, ...cfg.opencode } } }
+  const ocTiers = Object.fromEntries(Object.entries(DEFAULT_CONFIG.pi.tiers).filter(([m]) => channelOf(m) === 'opencode'))
+  const next: Config = {
+    ...cfg,
+    pi: {
+      ...cfg.pi,
+      providers: { ...cfg.pi.providers, opencode: DEFAULT_CONFIG.pi.providers.opencode as Provider },
+      tiers: { ...cfg.pi.tiers, ...ocTiers },
+      strengths: { ...DEFAULT_CONFIG.pi.strengths, ...cfg.pi.strengths },
+    },
+    opencode: { ...DEFAULT_CONFIG.opencode },
+  }
+  const untouched =
+    JSON.stringify(cfg.pi.fallback) === JSON.stringify(LEGACY_FALLBACK) &&
+    Object.entries(LEGACY_ROLES).every(([name, models]) => JSON.stringify(cfg.pi.roles[name]?.models) === JSON.stringify(models))
+  if (untouched) return { cfg: buildRoles(next), note: 'auto-router 0.3：加上了 opencode 免费模型，各角色已按新档位重排（旧配置备份为 .bak）' }
+  return { cfg: next, note: 'auto-router 0.3：加上了 opencode 免费模型的档位；你手调过角色顺序，没动，到 /auto-router「外派模型」页点“按档位重排”即可用上' }
 }
 
 export async function saveConfig($: EngineInterface, isWindows: boolean, config: Config): Promise<void> {
@@ -255,6 +358,7 @@ export async function saveConfig($: EngineInterface, isWindows: boolean, config:
 
 const CLAUDE_MODELS = ['haiku', 'sonnet', 'opus']
 const TIERS: string[] = ['strong', 'mid', 'light']
+const BILLINGS: Billing[] = ['free', 'subscription', 'token']
 const HHMM_RANGE = /^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-4]):[0-5]\d$/
 const DATE = /^\d{4}-\d{2}-\d{2}$/
 
@@ -286,9 +390,18 @@ export function validate(cfg: Config): string[] {
   for (const [m, t] of Object.entries(cfg.pi?.tiers ?? {})) {
     if (!TIERS.includes(t)) errs.push(`pi.tiers 里「${m}」的档位只能是 ${TIERS.join(' / ')}`)
   }
+  if (!Array.isArray(cfg.pi?.keepExtensions) || !cfg.pi.keepExtensions.every(x => typeof x === 'string' && x.trim())) {
+    errs.push('pi.keepExtensions 要是扩展包名列表')
+  }
+  for (const [m, list] of Object.entries(cfg.pi?.strengths ?? {})) {
+    if (!Array.isArray(list) || !list.every(r => typeof r === 'string')) errs.push(`pi.strengths 里「${m}」要是角色名列表`)
+  }
+  const oc = cfg.opencode
+  if (!Array.isArray(oc?.allowDirs) || !oc.allowDirs.every(d => typeof d === 'string' && d.trim())) errs.push('opencode.allowDirs 要是目录列表，可以为空 []')
+  if (!Array.isArray(oc?.logged) || !oc.logged.every(m => typeof m === 'string')) errs.push('opencode.logged 要是模型列表，可以为空 []')
   for (const [name, p] of Object.entries(providers)) {
     if (typeof p?.enabled !== 'boolean') errs.push(`pi.providers.${name}.enabled 要是 true / false`)
-    if (p?.billing !== 'subscription' && p?.billing !== 'token') errs.push(`pi.providers.${name}.billing 只能是 subscription / token`)
+    if (!BILLINGS.includes(p?.billing)) errs.push(`pi.providers.${name}.billing 只能是 ${BILLINGS.join(' / ')}`)
     if (p?.peak) {
       if (!Array.isArray(p.peak.hours) || !p.peak.hours.every(h => HHMM_RANGE.test(h))) errs.push(`pi.providers.${name}.peak.hours 每项要像 "09:00-12:00"`)
       if (!Array.isArray(p.peak.weekdays) || !p.peak.weekdays.every(d => Number.isInteger(d) && d >= 0 && d <= 6)) errs.push(`pi.providers.${name}.peak.weekdays 是 0–6 的数字，0 = 周日`)
@@ -363,6 +476,49 @@ export function providerOf(model: string): string {
   return model.split('/')[0] ?? model
 }
 
+/** 模型走哪个通道：opencode/ 开头的走 opencode run，其余走 pi */
+export function channelOf(model: string): Channel {
+  return providerOf(model) === 'opencode' ? 'opencode' : 'pi'
+}
+
+/** 带通道标签的模型名，如 "[opencode] opencode/glm-5.3-flash-free" */
+export function tagged(model: string): string {
+  return `[${channelOf(model)}] ${model}`
+}
+
+/** 解析 `opencode models` 的输出：一行一个 provider/id，只留 opencode 自己的 */
+export function parseOpencodeModels(stdout: string): string[] {
+  return stdout
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => /^opencode\/\S+$/.test(l))
+}
+
+function normDir(dir: string, isWindows: boolean): string {
+  const d = dir.replace(/\\/g, '/').replace(/\/+$/, '')
+  return isWindows ? d.toLowerCase() : d
+}
+
+function inside(dir: string, parent: string, isWindows: boolean): boolean {
+  const a = normDir(dir, isWindows)
+  const b = normDir(parent, isWindows)
+  return a === b || a.startsWith(`${b}/`)
+}
+
+/**
+ * 隐私开关：这个任务能不能发给这个 opencode 模型；不能时返回原因。
+ * logged 里的模型只在 allowDirs 里的目录用；allowDirs 有值时，长文阅读也只在这些目录里用 opencode。
+ */
+export function privacyBlock(cfg: Config, model: string, role: string, cwd: string, isWindows: boolean): string | undefined {
+  if (channelOf(model) !== 'opencode') return undefined
+  const dirs = cfg.opencode.allowDirs
+  const allowed = dirs.includes('*') || dirs.some(d => inside(cwd, d, isWindows))
+  if (allowed) return undefined
+  if (cfg.opencode.logged.includes(model)) return '官方说明里这个免费模型会记录使用或拿数据改进模型，目录不在 opencode.allowDirs 里'
+  if (role === 'longctx' && dirs.length > 0) return '长文阅读要整目录发出去，目录不在 opencode.allowDirs 里'
+  return undefined
+}
+
 function minutes(hhmm: string): number {
   const [h, m] = hhmm.split(':').map(Number)
   return (h ?? 0) * 60 + (m ?? 0)
@@ -400,23 +556,32 @@ export function chainFor(config: Config, role: string, now?: number): string[] {
 }
 
 /**
- * 此刻真正要试的模型：角色链去掉关掉、高峰、熔断（isDown）的；
+ * 此刻真正要试的模型：角色链去掉关掉、高峰、熔断（isDown）、被 skip 拦下（隐私开关、已下架）的；
  * 一个都不剩时改用兜底列表（同样过滤），isFallback 标出来
  */
 export function liveChain(
   cfg: Config,
   role: string,
   now: number,
-  isDown: (provider: string) => boolean = () => false,
+  isDown: (providerOrModel: string) => boolean = () => false,
+  skip: (model: string) => boolean = () => false,
 ): { models: string[]; isFallback: boolean } {
-  const ok = (m: string) => !isDown(providerOf(m))
-  const primary = chainFor(cfg, role, now).filter(ok)
+  const primary = chainFor(cfg, role, now).filter(m => !isDown(providerOf(m)) && !isDown(m) && !skip(m))
   if (primary.length) return { models: primary, isFallback: false }
-  const usable = (m: string) => {
+  return { models: usableFallback(cfg, now, isDown, skip), isFallback: true }
+}
+
+/** 此刻能用的兜底模型：去掉关掉的、在高峰的、已暂停的、被 skip 拦下的 */
+export function usableFallback(
+  cfg: Config,
+  now: number,
+  isDown: (providerOrModel: string) => boolean = () => false,
+  skip: (model: string) => boolean = () => false,
+): string[] {
+  return cfg.pi.fallback.filter(m => {
     const p = cfg.pi.providers[providerOf(m)]
-    return p?.enabled !== false && !isPeak(p?.peak, now) && ok(m)
-  }
-  return { models: cfg.pi.fallback.filter(usable), isFallback: true }
+    return p?.enabled !== false && !isPeak(p?.peak, now) && !isDown(providerOf(m)) && !isDown(m) && !skip(m)
+  })
 }
 
 /** 链上模型现在都在高峰时，最早能跑的时刻 */
@@ -424,61 +589,81 @@ export function earliestRun(config: Config, chain: string[], now: number): numbe
   return Math.min(...chain.map(m => nextOffPeak(config.pi.providers[providerOf(m)]?.peak, now)))
 }
 
-// ---------- 按档位生成角色（pi 模型页改档位时调用） ----------
+// ---------- 按档位生成角色（外派模型页改档位时调用） ----------
+
+/** 只取某种计费方式：free 免费，paid 订阅或按量，sub 只要订阅 */
+type BillingPick = 'free' | 'paid' | 'sub'
 
 type RoleTemplate = {
-  /** 依次从哪些档位取几个模型 */
-  pick: [Tier, number][]
+  /** 依次从哪个档位、哪种计费方式取几个模型；不写计费方式表示都行（同档里仍是 免费 → 订阅 → 按量） */
+  pick: [Tier, number, BillingPick?][]
   /** 这些档位里倒过来取（同档排在后面的更快更便宜） */
   cheaper?: Tier[]
   readOnly?: boolean
 }
 
-// 和默认配置的取舍一致：评审要最强，编码、看图、批量取强档里快的，文本类用轻档；同档里订阅排在按量付费前面
+// 和默认配置的取舍一致：评审要最强，编码、看图、批量取强档里快的，文本类用轻档；
+// 免费的中档模型补在 GPT 后面或打头（按擅长标签挑哪一个），按量付费的 deepseek 排在最后
 export const ROLE_TEMPLATES: Record<string, RoleTemplate> = {
-  review: { pick: [['strong', 2], ['mid', 1]], readOnly: true },
-  code: { pick: [['strong', 2], ['mid', 1]], cheaper: ['strong'] },
-  vision: { pick: [['strong', 2], ['mid', 1]], cheaper: ['strong'] },
-  bulk: { pick: [['strong', 1], ['light', 1], ['mid', 1]], cheaper: ['strong'] },
-  longctx: { pick: [['mid', 1], ['strong', 1]], cheaper: ['strong'], readOnly: true },
-  quick: { pick: [['light', 1], ['strong', 1], ['mid', 1]], cheaper: ['strong'] },
-  text: { pick: [['light', 2], ['mid', 1]], readOnly: true },
-  trivial: { pick: [['light', 2], ['mid', 1]], cheaper: ['light'], readOnly: true },
+  review: { pick: [['strong', 2], ['mid', 1, 'free'], ['mid', 1, 'paid']], readOnly: true },
+  code: { pick: [['strong', 2], ['mid', 1, 'free'], ['mid', 1, 'paid']], cheaper: ['strong'] },
+  vision: { pick: [['strong', 1], ['mid', 1, 'free'], ['strong', 1]], cheaper: ['strong'] },
+  bulk: { pick: [['strong', 1], ['mid', 1, 'free'], ['light', 1, 'paid']], cheaper: ['strong'] },
+  longctx: { pick: [['mid', 1, 'free'], ['mid', 1, 'paid'], ['strong', 1]], cheaper: ['strong'], readOnly: true },
+  quick: { pick: [['mid', 1, 'free'], ['light', 1, 'paid'], ['strong', 1]], cheaper: ['strong'] },
+  text: { pick: [['mid', 1, 'free'], ['light', 2, 'paid']], readOnly: true },
+  trivial: { pick: [['light', 1, 'free'], ['light', 1, 'paid'], ['light', 1, 'free']], cheaper: ['light'], readOnly: true },
 }
 
-/** 某档里能用的模型：提供商开着，订阅在前、按量在后，各自保持 tiers 里的先后 */
-function tierModels(cfg: Config, tier: Tier, cheaper: boolean): string[] {
+const BILLING_RANK: Record<Billing, number> = { free: 0, subscription: 1, token: 2 }
+
+/**
+ * 某档里能用的模型：提供商开着；免费 → 订阅 → 按量；同一计费方式里擅长 role 的在前、没标擅长的居中、
+ * 只擅长别的角色的在后；再往下保持 tiers 里的先后（cheaper 时倒过来）
+ */
+function tierModels(cfg: Config, tier: Tier, cheaper: boolean, role?: string, billing?: BillingPick): string[] {
+  const bill = (m: string) => cfg.pi.providers[providerOf(m)]?.billing ?? 'subscription'
   const list = Object.entries(cfg.pi.tiers)
     .filter(([m, t]) => t === tier && cfg.pi.providers[providerOf(m)]?.enabled !== false)
     .map(([m]) => m)
+    .filter(m => !billing || (billing === 'free' ? bill(m) === 'free' : billing === 'sub' ? bill(m) === 'subscription' : bill(m) !== 'free'))
   if (cheaper) list.reverse()
-  const sub = list.filter(m => cfg.pi.providers[providerOf(m)]?.billing !== 'token')
-  return [...sub, ...list.filter(m => !sub.includes(m))]
+  const fit = (m: string) => {
+    const s = cfg.pi.strengths?.[m] ?? []
+    return role && s.includes(role) ? 0 : s.length === 0 ? 1 : 2
+  }
+  return list
+    .map((m, i) => ({ m, i }))
+    .sort((a, b) => BILLING_RANK[bill(a.m)] - BILLING_RANK[bill(b.m)] || fit(a.m) - fit(b.m) || a.i - b.i)
+    .map(x => x.m)
 }
 
 /**
  * 按档位重建内置角色和兜底；角色原来的说明和只读设置保留，自己加的角色不动。
- * 某档没有模型就跳过；一个角色一个都取不到时，用任意一个有档位的模型顶上。
+ * 某档或某种计费方式没有模型就跳过；取到的不到 2 个时，从模板用到的档位里不限计费方式补到 2 个；
+ * 一个都取不到时，用任意一个有档位的模型顶上。
  */
 export function buildRoles(cfg: Config): Config {
   const roles: Record<string, Role> = {}
   const any = (['strong', 'mid', 'light'] as Tier[]).flatMap(t => tierModels(cfg, t, false))
   for (const [name, tpl] of Object.entries(ROLE_TEMPLATES)) {
     const models: string[] = []
-    for (const [tier, n] of tpl.pick) {
-      tierModels(cfg, tier, tpl.cheaper?.includes(tier) === true)
+    const take = (tier: Tier, n: number, billing?: BillingPick) =>
+      tierModels(cfg, tier, tpl.cheaper?.includes(tier) === true, name, billing)
         .filter(m => !models.includes(m))
         .slice(0, n)
         .forEach(m => models.push(m))
-    }
+    for (const [tier, n, billing] of tpl.pick) take(tier, n, billing)
+    for (const [tier] of tpl.pick) if (models.length < 2) take(tier, 2 - models.length)
     if (models.length === 0 && any[0]) models.push(any[0])
     if (models.length === 0) continue
     const old = cfg.pi.roles[name] ?? DEFAULT_CONFIG.pi.roles[name]
     roles[name] = { description: old?.description ?? name, models, readOnly: cfg.pi.roles[name]?.readOnly ?? tpl.readOnly }
   }
   for (const [name, r] of Object.entries(cfg.pi.roles)) if (!roles[name] && !ROLE_TEMPLATES[name]) roles[name] = r
-  const light = tierModels(cfg, 'light', false).filter(m => cfg.pi.providers[providerOf(m)]?.billing !== 'token')
-  const fallback = light.length ? light.slice(0, 2) : tierModels(cfg, 'mid', false).slice(0, 1)
+  // 兜底：轻档的订阅两个，再加两个适合兜底的免费中档；都没有时用一个中档
+  const fallback = [...tierModels(cfg, 'light', false, 'fallback', 'sub').slice(0, 2), ...tierModels(cfg, 'mid', false, 'fallback', 'free').slice(0, 2)]
+  if (fallback.length === 0) fallback.push(...tierModels(cfg, 'mid', false).slice(0, 1))
   const names = Object.keys(roles)
   const defaultRole = roles[cfg.pi.defaultRole] ? cfg.pi.defaultRole : (names[0] ?? cfg.pi.defaultRole)
   const categories = cfg.claude.categories.map(c => (c.piRole && !roles[c.piRole] ? { ...c, piRole: undefined } : c))

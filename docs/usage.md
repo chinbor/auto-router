@@ -9,7 +9,9 @@
    /plugin install auto-router@auto-router
    ```
 
-2. （可选）安装 pi 并配好各家的 key，`pi --list-models` 里能看到模型就行。没装 pi 也能用模型切换和省额度，只是没有外派。
+2. （可选）安装外派用的工具，装一个或两个都行；都没装也能用模型切换和省额度，只是没有外派：
+   - pi：配好各家的 key，`pi --list-models` 里能看到模型就行；
+   - opencode：`npm i -g @opencode/cli`，免费模型不用 key，`opencode models` 里能看到 `opencode/` 开头的模型就行。
 3. （可选）看图工具 `scripts/img_check.py` 需要 Python；处理视频截帧需要 ffmpeg。
 4. 重开一个会话。第一次运行会生成 `~/.claude/auto-router.json`，并提示打开 `/auto-router`。
 
@@ -17,9 +19,10 @@
 
 | 步骤 | 操作 |
 |---|---|
-| 1 | 运行 `/auto-router`，会直接进入「pi 模型」页 |
-| 2 | 每家提供商选"订阅 / 按量付费 / 不用" |
-| 3 | 展开一家，给要用的模型标"强 / 中 / 轻"，各角色的模型顺序会立即重排 |
+| 1 | 运行 `/auto-router`，会直接进入「外派模型」页；每个模型旁标着 `[pi]` 或 `[opencode]` |
+| 2 | 每家提供商选"免费 / 订阅 / 按量付费 / 不用"（OpenCode 免费模型一组默认"免费"，排在最后） |
+| 3 | 展开一家，给要用的模型标"强 / 中 / 轻"，各角色的模型顺序会立即重排；也可以点"按档位重排" |
+| 3a | （用 opencode 时）在 opencode 一组决定"会记录使用"的免费模型能在哪些目录用：允许当前目录 / 全部目录 / 都不允许（默认） |
 | 4 | 切到「Claude 模型」页，确认每类问题用哪个模型（默认值一般就行） |
 | 5 | （可选）"更多设置"里打开对照实验，选 `both` |
 
@@ -37,18 +40,20 @@
 | 当前模型不够用 | 直接说"不对""重做"，本轮升一档 |
 | 分类好像不工作 | 跟 Claude 说"用 router_config 的 probe 检查一下分类器" |
 
-### pi 外派
+### 外派（pi / opencode）
 
 | 想要 | 怎么做 |
 |---|---|
 | 让 Claude 自己决定外派 | 默认开着：分类判断适合外派时，会给 Claude 附一句建议 |
-| 明确要外派 | 跟 Claude 说"把这个交给 pi 的 bulk 角色做" |
+| 明确要外派 | 跟 Claude 说"把这个交给 bulk 角色做" |
+| 指定用免费模型 | 跟 Claude 说"派给 opencode/glm-5.3-flash-free"；结果开头标 `[opencode …]` |
+| 看走的哪条通道 | 结果开头、状态行（`🚀 opencode · 文本 · …`）、任务页都标着 pi 或 opencode |
 | 手动派任务 | `/auto-router run [角色] <任务>`，后台运行，完成后提示 |
 | 看任务 | `/auto-router jobs` |
 | 取后台任务结果 | Claude 调 `pi_result`，或在任务页看 |
-| 某家被熔断了 | 面板 pi 页，那家提供商上点"恢复" |
+| 某家被熔断了 | 面板「外派模型」页，那家提供商上点"恢复"；opencode 免费模型额度用完时只停那一个，派活顺序里写着几点恢复 |
 
-可写角色要求工作目录是干净的 git 仓库。pi 改完不会自动提交，由 Claude 用 `git diff` 审阅后再决定保留还是撤销。
+可写角色要求工作目录是干净的 git 仓库。外派的模型改完不会自动提交，由 Claude 用 `git diff` 审阅后再决定保留还是撤销。只读角色在两条通道上都真的不能写：pi 禁掉 edit / write / bash，opencode 换成插件注入的只读代理（不是 `plan`，`plan` 还能跑 bash）。
 
 ### 省额度（自动）
 
@@ -72,7 +77,7 @@
 | 看摘要 | `/auto-router stats` |
 | 原始数据 | `/auto-router path` 显示日志目录 |
 
-结论规则：每组至少 8 个会话，差值超过两倍标准误才下结论。设计细节见 [experiment.md](experiment.md)。
+结论规则：每组至少 15 个会话（不到 3 轮的不算），按会话花费的几何平均比较，差值超过两倍标准误才下结论。设计细节见 [experiment.md](experiment.md)。
 
 ## 四、命令速查
 
@@ -81,14 +86,14 @@
 | `/auto-router` | 打开设置面板 |
 | `/auto-router pi` / `stats` / `jobs` | 直接打开对应页 |
 | `/auto-router eval [天数]` | 对照实验报告 |
-| `/auto-router run [角色] <任务>` | 手动派 pi 任务 |
+| `/auto-router run [角色] <任务>` | 手动派外派任务（按角色的链走 pi 或 opencode） |
 | `/auto-router export [文件]` | 导出配置给别人 |
 | `/auto-router import <文件>` | 导入配置，旧配置备份成 `.bak` |
 | `/auto-router path` | 显示配置文件和日志位置 |
 
 | 工具（Claude 调用） | 作用 |
 |---|---|
-| `pi_dispatch` | 派任务给 pi |
+| `pi_dispatch` | 派任务给 pi 或 opencode（`opencode/` 开头的模型走 opencode；名字沿用旧的） |
 | `pi_result` | 取后台任务结果 |
 | `router_config` | `get` / `set` / `reset` 配置，`probe` 自检分类器 |
 
@@ -99,7 +104,10 @@
 | 日志里分类全是"超时"或"分类出错" | 多半是插件自己的模型请求被 429 限流（额度用到八成以上时常见）。新版会自动改用 fork；用 `probe` 确认哪条路能通 |
 | 第一条消息没切换 | 正常现象：还没有可 fork 的请求 |
 | 日志里有"跳过（换不了模型）" | 已经在 Opus 且上下文长到不降档，分类没有意义，省掉了 fork |
-| pi 任务一直在排队 | 能接这个角色的模型都在高峰或被暂停；面板 pi 页看状态，或把节假日加进配置 |
+| 外派任务一直在排队 | 能接这个角色的模型都在高峰或被暂停；面板「外派模型」页看状态，或把节假日加进配置 |
+| 结果里写"跳过（已下架）" | 这个免费模型 opencode 已经不提供了；面板里它被划掉，派活时自动换下一个。可以从角色里删掉，或点"按档位重排" |
+| 结果里写"跳过（…不在 opencode.allowDirs 里）" | 这个免费模型官方说明会记录使用，默认不在任何目录用。确实不在意时在 opencode 一组里允许当前目录或全部目录 |
+| 升级后配置变了 | 0.2 的配置会自动加上 opencode；还是旧默认角色的会按新档位重排，原文件存成 `auto-router.json.bak` |
 | 可写任务被拒 | 工作目录不是 git 仓库，或有未提交的改动；先提交或 stash |
 | 手改配置后弹"校验不通过" | 按提示修改，或让 Claude 用 `router_config reset` 恢复默认（旧配置备份成 `.bak`） |
 | 拦截误伤 | 原样再请求一次就会放行；频繁误伤可以关掉拦截开关，并提 issue |

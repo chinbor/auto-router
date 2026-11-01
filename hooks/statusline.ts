@@ -2,6 +2,7 @@
 // $.ui.status 只能放纯文字，所以用颜色圆点区分模型档位，用 emoji 区分类别和原因。纯函数，方便测试。
 
 import type { RouterDecision } from '../types'
+import { channelOf } from './config'
 
 const MODEL_DOT: Record<string, string> = { haiku: '🟢', sonnet: '🔵', opus: '🟣' }
 const MODEL_NAME: Record<string, string> = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus' }
@@ -66,11 +67,11 @@ export function routeStatus(
   } else if (opts.prevModel && rank(opts.prevModel) >= 0 && rank(model) >= 0 && rank(opts.prevModel) !== rank(model)) {
     parts.push(rank(model) > rank(opts.prevModel) ? `⬆ 自 ${modelTag(opts.prevModel)}` : `⬇ 自 ${modelTag(opts.prevModel)}`)
   }
-  if (opts.showPi && d.piRole) parts.push(`🚀 可派 pi（${ROLE_NAME[d.piRole] ?? d.piRole}）`)
+  if (opts.showPi && d.piRole) parts.push(`🚀 可外派（${ROLE_NAME[d.piRole] ?? d.piRole}）`)
   return parts.join(SEP)
 }
 
-/** pi 任务运行时的状态行 */
+/** 外派任务运行时的状态行：按通道显示，如「🚀 opencode · 文本 · glm-5.3-flash-free 运行中」 */
 export function piStatus(role: string, model: string): string {
-  return ['🚀 pi', ROLE_NAME[role] ?? role, `${model.split('/').slice(1).join('/') || model} 运行中`].join(SEP)
+  return [`🚀 ${channelOf(model)}`, ROLE_NAME[role] ?? role, `${model.split('/').slice(1).join('/') || model} 运行中`].join(SEP)
 }

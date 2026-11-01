@@ -62,6 +62,8 @@ export type PiRecord = {
   ts: number
   role: string
   model: string
+  /** 走哪个通道；0.3 之前的记录没有，用 channelOfRecord 按模型前缀推断 */
+  ch?: 'pi' | 'opencode'
   ok: boolean
   ms: number
   ro?: boolean
@@ -70,6 +72,11 @@ export type PiRecord = {
 } & SessionTags
 
 export type LogRecord = TurnRecord | PiRecord | GuardRecord
+
+/** 外派记录的通道：旧记录没有 ch，opencode/ 开头的模型算 opencode，其余算 pi */
+export function channelOfRecord(r: Pick<PiRecord, 'ch' | 'model'>): 'pi' | 'opencode' {
+  return r.ch ?? (r.model.startsWith('opencode/') ? 'opencode' : 'pi')
+}
 
 export function parseLog(text: string): LogRecord[] {
   const out: LogRecord[] = []
@@ -117,7 +124,7 @@ export type Summary = {
   savedUsd?: number
   /** 自动组实际花费里，用了小模型的那部分 */
   cheapUsd: number
-  pi: { total: number; ok: number; byModel: Record<string, number>; files: number }
+  pi: { total: number; ok: number; byModel: Record<string, number>; byChannel: Record<string, number>; files: number }
   /** 窗口内 7 天额度百分比的最早、最晚读数 */
   week?: { first: number; last: number }
 }
@@ -184,7 +191,12 @@ export function summarize(records: LogRecord[], from: number): Summary {
   }
 
   const piByModel: Record<string, number> = {}
-  for (const p of pis) piByModel[p.model] = (piByModel[p.model] ?? 0) + 1
+  const piByChannel: Record<string, number> = {}
+  for (const p of pis) {
+    piByModel[p.model] = (piByModel[p.model] ?? 0) + 1
+    const ch = channelOfRecord(p)
+    piByChannel[ch] = (piByChannel[ch] ?? 0) + 1
+  }
   const wk = turns.filter(r => r.wk !== undefined)
   return {
     from,
@@ -192,7 +204,7 @@ export function summarize(records: LogRecord[], from: number): Summary {
     unitPrice,
     savedUsd: canEstimate ? saved : undefined,
     cheapUsd,
-    pi: { total: pis.length, ok: pis.filter(p => p.ok).length, byModel: piByModel, files: pis.reduce((n, p) => n + (p.files ?? 0), 0) },
+    pi: { total: pis.length, ok: pis.filter(p => p.ok).length, byModel: piByModel, byChannel: piByChannel, files: pis.reduce((n, p) => n + (p.files ?? 0), 0) },
     week: wk.length ? { first: wk[0]?.wk as number, last: wk[wk.length - 1]?.wk as number } : undefined,
   }
 }
@@ -231,12 +243,24 @@ export type SessionStats = {
   agains: number
   /** 会话内 7 天额度百分比涨了多少（额度窗口重置的回落不算） */
   wk: number
+  /** 第一条、最后一条记录的时间 */
+  start: number
+  end: number
+  /** 和别的会话同时开过：7 天额度是整个账号共用的，这时 wk 里混着别的会话的消耗 */
+  overlap: boolean
+  /** 外派任务数和总耗时；外派模型的花费不在 usd 里 */
+  piJobs: number
+  piMs: number
 }
 
 export type CellStats = {
   sessions: number
   turns: number
   usd: number
+  /** 主指标：每会话花费取对数后的平均值和标准误（会话花费长尾，少数大会话会主导算术平均）；geoUsd 是对应的几何平均 */
+  logUsd: number
+  logUsdSe: number
+  geoUsd: number
   /** 每会话“每轮花费”的平均值和标准误 */
   perTurn: number
   perTurnSe: number
@@ -248,6 +272,9 @@ export type CellStats = {
   guards: number
   againRate: number
   wkPerSession: number
+  /** 算进 wkPerSession 的会话数（没和别的会话同时开的） */
+  wkSessions: number
+  piJobs: number
   subShare: number
   /** 花费里 fork 分类的估算占比 */
   forkShare: number
@@ -258,10 +285,12 @@ export type Effect = {
   /** 实验组（auto / on）和对照组（control / off） */
   on: CellStats
   off: CellStats
-  /** 每轮花费的相对变化，负数是省 */
+  /** 每会话花费（几何平均）的相对变化，负数是省 */
   change: number
-  /** 两组各有 MIN_SESSIONS 个会话，且差值超过两倍合并标准误 */
+  /** 两组各有 MIN_SESSIONS 个会话，且对数差超过两倍合并标准误 */
   sure: boolean
+  /** 辅助参考：每轮花费的相对变化（拦截后用户再请求会多出便宜的轮次，所以不作主指标） */
+  perTurnChange: number
 }
 
 export type ExperimentReport = {
@@ -269,9 +298,14 @@ export type ExperimentReport = {
   /** 分格，键是 "auto|on" 这样；只测一维时另一维写 "-" */
   cells: Record<string, CellStats>
   effects: Effect[]
+  /** 轮数太少、没算进实验的会话数 */
+  short: number
 }
 
-export const MIN_SESSIONS = 8
+/** 每组至少这么多会话才下结论；事先定好，到量前的数只作参考，免得反复看、看到显著就停 */
+export const MIN_SESSIONS = 15
+/** 少于这么多轮的会话不算：多是试一下就关、或别处起的一次性会话，会把平均值拉偏 */
+export const MIN_TURNS = 3
 const LONG_CTX = 300_000
 
 export function sessionStats(records: LogRecord[]): SessionStats[] {
@@ -279,11 +313,20 @@ export function sessionStats(records: LogRecord[]): SessionStats[] {
   const by = new Map<string, Acc>()
   const price = unitPrices(records.filter((r): r is TurnRecord => r.t === 'turn'))
   for (const r of [...records].sort((a, b) => a.ts - b.ts)) {
-    if (r.t === 'pi' || !r.ex || !r.sid) continue
+    if (!r.ex || !r.sid) continue
     let s = by.get(r.sid)
     if (!s) {
-      s = { sid: r.sid, ra: r.ra, sv: r.sv, turns: 0, usd: 0, subUsd: 0, forkUsd: 0, ctxAvg: 0, ctxMax: 0, ctxSum: 0, ctxN: 0, fixes: 0, guards: 0, agains: 0, wk: 0 }
+      s = {
+        sid: r.sid, ra: r.ra, sv: r.sv, turns: 0, usd: 0, subUsd: 0, forkUsd: 0, ctxAvg: 0, ctxMax: 0, ctxSum: 0, ctxN: 0,
+        fixes: 0, guards: 0, agains: 0, wk: 0, start: r.ts, end: r.ts, overlap: false, piJobs: 0, piMs: 0,
+      }
       by.set(r.sid, s)
+    }
+    s.end = r.ts
+    if (r.t === 'pi') {
+      s.piJobs++
+      s.piMs += r.ms
+      continue
     }
     if (r.t === 'guard') {
       if (r.again) s.agains++
@@ -310,9 +353,20 @@ export function sessionStats(records: LogRecord[]): SessionStats[] {
       s.wkLast = r.wk
     }
   }
-  return [...by.values()]
+  const list = [...by.values()]
     .filter(s => s.turns > 0)
     .map(({ ctxSum, ctxN, wkLast: _w, lastModel: _m, ...s }) => ({ ...s, ctxAvg: ctxN ? ctxSum / ctxN : 0 }))
+  // 同时开着的会话（含不在实验里的）：按所有带会话 id 的记录算各会话的起止时间
+  const spans = new Map<string, [number, number]>()
+  for (const r of records) {
+    if (!r.sid) continue
+    const sp = spans.get(r.sid)
+    spans.set(r.sid, sp ? [Math.min(sp[0], r.ts), Math.max(sp[1], r.ts)] : [r.ts, r.ts])
+  }
+  for (const s of list) {
+    for (const [sid, [a, b]] of spans) if (sid !== s.sid && a <= s.end && b >= s.start) s.overlap = true
+  }
+  return list
 }
 
 export function cellStats(list: SessionStats[]): CellStats {
@@ -320,30 +374,42 @@ export function cellStats(list: SessionStats[]): CellStats {
   const sum = (f: (s: SessionStats) => number) => list.reduce((a, s) => a + f(s), 0)
   const turns = sum(s => s.turns)
   const usd = sum(s => s.usd)
-  const per = list.map(s => s.usd / s.turns)
-  const mean = n ? per.reduce((a, b) => a + b, 0) / n : 0
-  const sd = n > 1 ? Math.sqrt(per.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1)) : 0
+  const meanSe = (xs: number[]): [number, number] => {
+    const m = xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0
+    const sd = xs.length > 1 ? Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1)) : 0
+    return [m, xs.length > 1 ? sd / Math.sqrt(xs.length) : 0]
+  }
+  const [perTurn, perTurnSe] = meanSe(list.map(s => s.usd / s.turns))
+  // 加一分钱再取对数，免得没花费的会话变成负无穷
+  const [logUsd, logUsdSe] = meanSe(list.map(s => Math.log(s.usd + 0.01)))
   const guards = sum(s => s.guards)
+  const wkList = list.filter(s => !s.overlap)
   return {
     sessions: n,
     turns,
     usd,
-    perTurn: mean,
-    perTurnSe: n > 1 ? sd / Math.sqrt(n) : 0,
+    logUsd,
+    logUsdSe,
+    geoUsd: n ? Math.exp(logUsd) - 0.01 : 0,
+    perTurn,
+    perTurnSe,
     turnsPerSession: n ? turns / n : 0,
     ctxAvg: n ? sum(s => s.ctxAvg) / n : 0,
     longShare: n ? list.filter(s => s.ctxMax >= LONG_CTX).length / n : 0,
     fixRate: turns ? sum(s => s.fixes) / turns : 0,
     guards,
     againRate: guards ? sum(s => s.agains) / guards : 0,
-    wkPerSession: n ? sum(s => s.wk) / n : 0,
+    wkPerSession: wkList.length ? wkList.reduce((a, s) => a + s.wk, 0) / wkList.length : 0,
+    wkSessions: wkList.length,
+    piJobs: sum(s => s.piJobs),
     subShare: usd ? sum(s => s.subUsd) / usd : 0,
     forkShare: usd ? sum(s => s.forkUsd) / usd : 0,
   }
 }
 
 export function experimentReport(records: LogRecord[], from: number): ExperimentReport {
-  const sessions = sessionStats(records.filter(r => r.ts >= from))
+  const all = sessionStats(records.filter(r => r.ts >= from))
+  const sessions = all.filter(s => s.turns >= MIN_TURNS)
   const groups = new Map<string, SessionStats[]>()
   for (const s of sessions) {
     const key = `${s.ra ?? '-'}|${s.sv ?? '-'}`
@@ -362,21 +428,25 @@ export function experimentReport(records: LogRecord[], from: number): Experiment
     if (!onList.length || !offList.length) continue
     const on = cellStats(onList)
     const off = cellStats(offList)
-    const se = Math.sqrt(on.perTurnSe ** 2 + off.perTurnSe ** 2)
+    // 在对数上比：差值就是几何平均之比的对数
+    const diff = on.logUsd - off.logUsd
+    const se = Math.sqrt(on.logUsdSe ** 2 + off.logUsdSe ** 2)
     effects.push({
       factor,
       on,
       off,
-      change: off.perTurn ? (on.perTurn - off.perTurn) / off.perTurn : 0,
-      sure: on.sessions >= MIN_SESSIONS && off.sessions >= MIN_SESSIONS && se > 0 && Math.abs(on.perTurn - off.perTurn) > 2 * se,
+      change: Math.exp(diff) - 1,
+      sure: on.sessions >= MIN_SESSIONS && off.sessions >= MIN_SESSIONS && se > 0 && Math.abs(diff) > 2 * se,
+      perTurnChange: off.perTurn ? (on.perTurn - off.perTurn) / off.perTurn : 0,
     })
   }
-  return { sessions, cells, effects }
+  return { sessions, cells, effects, short: all.length - sessions.length }
 }
 
 export function verdict(e: Effect): string {
   const pct = (x: number) => `${Math.round(x * 100)}%`
-  if (e.on.sessions < MIN_SESSIONS || e.off.sessions < MIN_SESSIONS) return `样本还不够（每组至少 ${MIN_SESSIONS} 个会话）`
+  const need = Math.max(MIN_SESSIONS - e.on.sessions, MIN_SESSIONS - e.off.sessions)
+  if (need > 0) return `样本还不够：每组要 ${MIN_SESSIONS} 个会话，还差 ${need} 个（现在的数只作参考）`
   if (!e.sure) return '差异在误差范围内，还说不准'
   return e.change < 0 ? `确实省了 ${pct(-e.change)}` : `反而多花 ${pct(e.change)}`
 }
@@ -386,21 +456,27 @@ export function reportText(rep: ExperimentReport, days: number): string {
   const money = (n: number) => (n < 0.001 ? '<$0.001' : `$${n.toFixed(n < 1 ? 3 : 2)}`)
   const pct = (x: number) => `${Math.round(x * 100)}%`
   const k = (n: number) => `${Math.round(n / 1000)}k`
+  if (!rep.sessions.length && rep.short) return `最近 ${days} 天的 ${rep.short} 个实验会话都不到 ${MIN_TURNS} 轮，还没有能算的。`
   if (!rep.sessions.length) return `最近 ${days} 天还没有实验会话。先在 /auto-router 打开“对照实验”，之后新开的会话会自动分组。`
   const NAME: Record<Effect['factor'], [string, string, string]> = {
     route: ['模型切换', '切换', '不切换'],
     saver: ['省额度', '开', '关'],
   }
-  const lines = [`对照实验（最近 ${days} 天，${rep.sessions.length} 个会话）`, '']
+  const skipped = rep.short ? `，另有 ${rep.short} 个不到 ${MIN_TURNS} 轮的没算` : ''
+  const lines = [`对照实验（最近 ${days} 天，${rep.sessions.length} 个会话${skipped}）`, '']
   for (const e of rep.effects) {
     const [title, a, b] = NAME[e.factor]
     lines.push(
       `【${title}】${verdict(e)}`,
       `  会话数     ${a} ${e.on.sessions}，${b} ${e.off.sessions}`,
-      `  每轮花费   ${a} ${money(e.on.perTurn)}±${money(e.on.perTurnSe)}，${b} ${money(e.off.perTurn)}±${money(e.off.perTurnSe)}`,
-      `  每会话     ${a} ${e.on.turnsPerSession.toFixed(1)} 轮 ${money(e.on.usd / e.on.sessions)}，${b} ${e.off.turnsPerSession.toFixed(1)} 轮 ${money(e.off.usd / e.off.sessions)}`,
+      `  每会话花费 ${a} ${money(e.on.geoUsd)}，${b} ${money(e.off.geoUsd)}（几何平均，主指标）`,
+      `  每会话     ${a} ${e.on.turnsPerSession.toFixed(1)} 轮，${b} ${e.off.turnsPerSession.toFixed(1)} 轮；算术平均 ${money(e.on.usd / e.on.sessions)} / ${money(e.off.usd / e.off.sessions)}`,
+      `  每轮花费   ${a} ${money(e.on.perTurn)}±${money(e.on.perTurnSe)}，${b} ${money(e.off.perTurn)}±${money(e.off.perTurnSe)}（参考：拦截后再请求会多出便宜的轮次）`,
       `  上下文     平均 ${k(e.on.ctxAvg)} / ${k(e.off.ctxAvg)}；到过 30 万的会话 ${pct(e.on.longShare)} / ${pct(e.off.longShare)}`,
-      `  7 天额度   每会话涨 ${e.on.wkPerSession.toFixed(1)} / ${e.off.wkPerSession.toFixed(1)} 个百分点`,
+      e.on.wkSessions && e.off.wkSessions
+        ? `  7 天额度   每会话涨 ${e.on.wkPerSession.toFixed(1)} / ${e.off.wkPerSession.toFixed(1)} 个百分点（只算没和别的会话同时开的 ${e.on.wkSessions} / ${e.off.wkSessions} 个）`
+        : '  7 天额度   会话都和别的会话同时开过，额度是整个账号共用的，分不出各会话用了多少',
+      `  外派       ${e.on.piJobs} / ${e.off.piJobs} 次（外派模型的花费不在上面的数里）`,
       `  质量       纠正率 ${pct(e.on.fixRate)} / ${pct(e.off.fixRate)}`,
     )
     if (e.factor === 'route') lines.push(`  分类花费   fork 分类约占切换组花费的 ${pct(e.on.forkShare)}（已含在每轮花费里）`)
@@ -413,11 +489,14 @@ export function reportText(rep: ExperimentReport, days: number): string {
     lines.push('分格（切换|省额度）：')
     for (const key of keys) {
       const c = rep.cells[key] as CellStats
-      lines.push(`  ${key.padEnd(13)} ${c.sessions} 会话  每轮 ${money(c.perTurn)}  纠正 ${pct(c.fixRate)}  上下文 ${k(c.ctxAvg)}`)
+      lines.push(`  ${key.padEnd(13)} ${c.sessions} 会话  每会话 ${money(c.geoUsd)}  每轮 ${money(c.perTurn)}  纠正 ${pct(c.fixRate)}  上下文 ${k(c.ctxAvg)}`)
     }
     lines.push('')
   }
-  lines.push('花费是按 API 价折算的美元，订阅不按它扣额度，但组间比例可以参考；两组做的活不一样时，差异也可能来自任务本身。')
+  lines.push(
+    '花费是按 API 价折算的美元，订阅不按它扣额度，但组间比例可以参考；两组做的活不一样时，差异也可能来自任务本身。',
+    '面板上看得到自己在哪组，在“不切换”组里手动换模型会让切换的效果被低估。',
+  )
   return lines.join('\n')
 }
 
