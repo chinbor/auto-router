@@ -28,7 +28,7 @@ type Harness = { files: Record<string, string>; sizes: Record<string, number>; b
  * 引擎替身：files 是磁盘（配置、日志都在里面，写入也落在这里），sizes 给 fs.stat 用，bytes 给按字节读用。
  * 配置文件按 cfg 预置；目录列表从 files 里推出来。
  */
-function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: string; ctx?: number | (() => number); wk?: number; toasts?: string[]; now?: () => number; tools?: string[] } = {}): Harness {
+function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: string; ctx?: number | (() => number); wk?: number; toasts?: string[]; toastMs?: number[]; now?: () => number; tools?: string[] } = {}): Harness {
   const h: Harness = { files: {}, sizes: {}, bytes: {} }
   if (opts.cfg) h.files.CFG = JSON.stringify(opts.cfg)
   // 配置文件和日志目录的真实位置从插件目录推出来，这里统一换成 CFG、LOG 两个键
@@ -46,6 +46,7 @@ function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: s
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.toast', (_, e) => {
     opts.toasts?.push(e.text)
+    opts.toastMs?.push(e.timeoutMs ?? 4000)
     return { value: undefined }
   })
   on('ui.status', () => ({ value: undefined }))
@@ -809,8 +810,9 @@ test('冷点上规则判出更轻的类别也不降档：规则没把握到能�
 
 test('长对话隔太久回来：提示一次缓存已过期、这轮要整段重写，建议开新会话或压缩', async ($, on) => {
   const toasts: string[] = []
+  const toastMs: number[] = []
   let skew = 0
-  harness(on, { cfg: DEFAULT_CONFIG, ctx: 150_000, toasts, now: () => Date.now() + skew })
+  harness(on, { cfg: DEFAULT_CONFIG, ctx: 150_000, toasts, toastMs, now: () => Date.now() + skew })
   on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[3]?.label }))
   await start($)
   await submit($, '实现登录功能')
@@ -824,6 +826,8 @@ test('长对话隔太久回来：提示一次缓存已过期、这轮要整段�
   expect(hit.length).toBe(1)
   expect(hit[0]).toContain('15 万 token')
   expect(hit[0]).toContain('/compact')
+  // 默认 4 秒读不完：按字数留时间
+  expect(toastMs[toasts.indexOf(hit[0] as string)]).toBeGreaterThanOrEqual(10_000)
 })
 
 test('配置里还是旧默认提醒点（30 万 / 60 万）的按新默认（20 万 / 40 万）提醒；改过的照旧', async ($, on) => {

@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { ModelMode, ModelRefresh, SettingsTab } from '../types'
-import { atLeast, buildRoles, CLAUDE_ALIASES, channelOf, claudeModelsFrom, isPeak, privacyBlock, providerOf, setPath } from './config'
+import { atLeast, buildRoles, CLAUDE_ALIASES, channelOf, claudeModelsFrom, isPeak, privacyBlock, providerOf, say, setPath } from './config'
 import type { Billing, Config, Tier } from './config'
 import { costSplit, delegateStats, demotedModels, experimentReport, modelVersions, redoStats, summarize, verdict, versionLabel } from './stats'
 import { categoryIcon, modelTag } from './statusline'
@@ -251,7 +251,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
         onPress={press =>
           void weeklyPrompt($)
             .then(text => $.ui.copy({ text, surface: press.surface }))
-            .then(r => $.ui.toast(r.isCopied ? '已复制：粘到任意平台的定时任务里，每周跑一次（详见 /auto-router weekly）' : '复制失败，改用 /auto-router weekly'))
+            .then(r => say($, r.isCopied ? '已复制：粘到任意平台的定时任务里，每周跑一次（详见 /auto-router weekly）' : '复制失败，改用 /auto-router weekly'))
         }
       />
     )

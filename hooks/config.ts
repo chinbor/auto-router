@@ -299,6 +299,11 @@ export function consumeCreated(): boolean {
   return was
 }
 
+/** 弹提示：按字数留够读完的时间（默认只停 4 秒，长句没读完就没了），每字约 0.25 秒，4–30 秒；指针停在上面不消失，点一下关掉 */
+export function say($: EngineInterface, text: string): void {
+  $.ui.toast(text, { timeoutMs: Math.min(30_000, Math.max(4_000, text.length * 250)) })
+}
+
 /**
  * 0.4.0 前的默认提醒点 30 万 / 60 万：日志里 20–40 万 token 的轮次占了六成花费，提醒得太晚。
  * 文件里还是旧默认值（用户没改过）就按新默认用，改过的照旧
@@ -336,11 +341,11 @@ export async function loadConfig($: EngineInterface, isWindows: boolean): Promis
       // 迁移只做一次：写回后文件里就有 opencode 段了；旧文件留一份 .bak
       await $.fs.write(`${path}.bak`, JSON.stringify(raw, null, 2) + '\n').catch(() => undefined)
       await saveConfig($, isWindows, cfg).catch(() => undefined)
-      $.ui.toast(note)
+      say($, note)
     }
     return cfg
   } catch (err) {
-    if (!warned) $.ui.toast(`auto-router 配置读取失败，先用默认值：${String(err).slice(0, 120)}`)
+    if (!warned) say($, `auto-router 配置读取失败，先用默认值：${String(err).slice(0, 120)}`)
     warned = true
     return DEFAULT_CONFIG
   }

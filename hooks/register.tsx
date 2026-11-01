@@ -14,6 +14,7 @@ import {
   migrateOpencode,
   privacyBlock,
   providerOf,
+  say,
   setPath,
   usableFallback,
 } from './config'
@@ -179,7 +180,8 @@ async function pauseProvider($: EngineInterface, cfg: Config, key: string, reaso
   if (cfg.pi.pauseMinutes <= 0) return
   const until = Date.now() + (ms ?? cfg.pi.pauseMinutes * 60_000)
   await update($, paused, map => ({ ...map, [key]: { until, reason } }))
-  $.ui.toast(
+  say(
+    $,
     key.includes('/')
       ? `${key} 免费额度用完，暂停到 ${clock(until)}，其他模型照常用。`
       : `${key} 报鉴权/额度错误，暂停到 ${clock(until)}。如果已经退订，到 /auto-router 提供商页关掉它。`,
@@ -515,9 +517,10 @@ async function gapNotice($: EngineInterface, cfg: Config): Promise<void> {
   const idle = (await nowMs($)) - mark.ts
   if (idle <= cfg.claude.coldGapMinutes * 60_000) return
   const usd = tokenUsd(lastMainModel ?? 'opus', { in: 0, cw: ctx, cr: 0, out: 0 }, ctx) ?? 0
-  $.ui.toast(
-    `隔了 ${Math.round(idle / 60_000)} 分钟，缓存已过期：这一轮要把 ${Math.round(ctx / 10_000)} 万 token 的上下文整段重写进缓存（约 $${usd.toFixed(2)}）。` +
-      '接下来做别的事就开新会话；还做这件事，可以等这轮答完 /compact，后面每轮都更便宜。',
+  say(
+    $,
+    `隔了 ${Math.round(idle / 60_000)} 分钟缓存已过期，这轮重写 ${Math.round(ctx / 10_000)} 万 token（约 $${usd.toFixed(2)}）。` +
+      '换别的事就开新会话；接着做就等这轮答完 /compact。',
   )
 }
 
@@ -540,11 +543,11 @@ export const register: Register = on => {
     await registerTools($, await config($))
     // 配置里改了 dataDir：把默认目录里的旧日志搬过去
     const moved = await moveLogs($).catch(() => 0)
-    if (moved) $.ui.toast(`auto-router 已把 ${moved} 个日志文件搬到新的数据目录 ${await logDir($)}`)
+    if (moved) say($, `auto-router 已把 ${moved} 个日志文件搬到新的数据目录 ${await logDir($)}`)
     const firstRun = consumeCreated()
     if (firstRun) {
       rt.firstRun = true
-      $.ui.toast('auto-router 已装好：换模型和省额度已经在工作。装了 pi 或 opencode 的，运行 /auto-router 在「外派模型」页确认一下外派用哪些模型')
+      say($, 'auto-router 已装好：换模型和省额度已经在工作。装了 pi 或 opencode 的，运行 /auto-router 在「外派模型」页确认一下外派用哪些模型')
     }
     // 等会话起来几秒再检测，不拖慢启动（opencode models 要好几秒）
     void $.clock.after(5_000, () => void detectChannels($, firstRun).catch(() => undefined))
