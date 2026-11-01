@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ModelMode, PiJob, RouterDecision, SettingsTab } from '../types'
+import type { ColdMark, ModelMode, PiJob, RouterDecision, SettingsTab } from '../types'
 import {
   chainFor,
   channelOf,
@@ -20,8 +20,9 @@ import {
 import type { BigRead } from './saver'
 import type { Config } from './config'
 import { checkTool, firstTime, rulesText } from './saver'
-import { categoryStats, categoryText, experimentReport, family, reportText, summarize } from './stats'
-import { decide, probeClassifier } from './classify'
+import { demotedModels, experimentReport, family, overlap, redoStats, REDO_OVERLAP, REDO_WINDOW, reportText, taskWords, tokenUsd } from './stats'
+import { doctor, effectReport, reportVersion, weeklyHelp, writeReport } from './report'
+import { coldReason, decide, probeClassifier } from './classify'
 import { renderPane } from './panel'
 import { piStatus, routeStatus } from './statusline'
 import {
@@ -34,6 +35,7 @@ import {
   imgCheck,
   logDir,
   logRecord,
+  moveLogs,
   opencodeArgv,
   opencodeEnv,
   opencodeHome,
@@ -43,6 +45,7 @@ import {
   refreshOpencodeModels,
   refreshPiModels,
   registerTools,
+  reportDir,
   resetSession,
   rt,
   saverHints,
@@ -65,6 +68,8 @@ const jobs = atom({ plugin: 'auto-router', key: 'jobs' } as const, [], { shape: 
 const modelMode = atom({ plugin: 'auto-router', key: 'modelMode' } as const, 'auto' as ModelMode)
 const piAuto = atom({ plugin: 'auto-router', key: 'piAuto' } as const, true)
 const lastDecision = atom({ plugin: 'auto-router', key: 'last' } as const, null, { shape: 'last-3' })
+/** 判断冷点用的上一轮时间、上下文；放在会话状态里，重载插件后不会被当成会话开头 */
+const coldMark = atom({ plugin: 'auto-router', key: 'cold' } as const, {} as ColdMark, { shape: 'cold-1' })
 const tab = atom({ plugin: 'auto-router', key: 'tab' } as const, 'claude' as SettingsTab)
 const piModels = atom({ plugin: 'auto-router', key: 'piModels' } as const, [], { shape: 'models-1' })
 const ocModels = atom({ plugin: 'auto-router', key: 'ocModels' } as const, [], { shape: 'models-1' })
@@ -80,6 +85,36 @@ const writing = new Set<string>()
 let seq = 0
 let lastCost: number | undefined
 let lastMainModel: string | undefined
+/** 主对话上一轮的分组：子代理的轮次跟着它记，免得对照组会话里的子代理被记成 auto */
+let lastMainArm: ReturnType<typeof armOf> | undefined
+/** 本会话最近派过的任务：判断新派的是不是返工（重载会丢，最多漏记几次） */
+const recentJobs: { id: string; role: string; words: Set<string>; model: string; ts: number; ok?: boolean }[] = []
+/** 任务 id → 它返工的那次用的模型 */
+const redoOf = new Map<string, string>()
+/** 返工多、派活时排到后面的模型；10 分钟按近 14 天日志重算一次 */
+let demoteCache: { at: number; models: Set<string> } | undefined
+
+async function demoted($: EngineInterface): Promise<Set<string>> {
+  if (demoteCache && Date.now() - demoteCache.at < 10 * 60_000) return demoteCache.models
+  const from = Date.now() - 14 * 86_400_000
+  const models = demotedModels(redoStats(await readLogs($, from).catch(() => []), from))
+  demoteCache = { at: Date.now(), models }
+  return models
+}
+
+/** 记下新派的任务；同一角色 30 分钟内派过相似、已完成的任务时，算作返工那一次 */
+function noteJob(job: PiJob, task: string) {
+  // 点名模型的多半是在试模型能不能用，同一句话派给几个模型不算返工
+  if (job.role === 'custom') return
+  const words = taskWords(task)
+  const now = Date.now()
+  const prev = [...recentJobs]
+    .reverse()
+    .find(j => j.role === job.role && j.ok && now - j.ts < REDO_WINDOW && overlap(j.words, words) >= REDO_OVERLAP)
+  if (prev) redoOf.set(job.id, prev.model)
+  recentJobs.push({ id: job.id, role: job.role, words, model: job.model, ts: now })
+  if (recentJobs.length > 20) recentJobs.shift()
+}
 
 
 type DispatchInput = { task: string; role?: string; model?: string; cwd?: string; readOnly?: boolean }
@@ -149,6 +184,8 @@ async function saveJob($: EngineInterface, job: PiJob) {
   await update($, jobs, list => [...list.filter(j => j.id !== job.id), job].slice(-30))
   if (job.status === 'done' || job.status === 'failed') {
     const files = Number(/改动了 (\d+) 个文件/.exec(job.changes ?? '')?.[1] ?? 0)
+    const seen = recentJobs.find(j => j.id === job.id)
+    if (seen) Object.assign(seen, { ok: job.status === 'done', model: job.model })
     void logRecord($, {
       t: 'pi',
       ts: Date.now(),
@@ -159,6 +196,7 @@ async function saveJob($: EngineInterface, job: PiJob) {
       ms: (job.endedAt ?? Date.now()) - job.startedAt,
       ro: job.readOnly,
       files,
+      redo: redoOf.get(job.id),
     })
   }
 }
@@ -223,7 +261,7 @@ async function runJob($: EngineInterface, job: PiJob, input: DispatchInput): Pro
     if (oc.skip(input.model)) chain = []
   } else {
     const isDown = await pausedCheck($)
-    const live = liveChain(cfg, job.role, Date.now(), isDown, oc.skip)
+    const live = liveChain(cfg, job.role, Date.now(), isDown, oc.skip, await demoted($))
     chain = live.models
     if (live.isFallback) noteSkips(cfg.pi.fallback)
     if (live.isFallback && chain.length) notes.push(`${job.role} 的模型此刻都用不了，改用兜底 ${chain.join(' → ')}`)
@@ -374,7 +412,7 @@ async function startJob(
   const oc = await opencodeSkips($, cfg, role, resolveCwd(input.cwd), all)
   const usable = input.model
     ? all.filter(m => !isPeak(cfg.pi.providers[providerOf(m)]?.peak, now))
-    : liveChain(cfg, role, now, await pausedCheck($), oc.skip).models
+    : liveChain(cfg, role, now, await pausedCheck($), oc.skip, await demoted($)).models
   const first = usable[0] ?? all[0] ?? '?'
   let job: PiJob = {
     id: `p${(++seq).toString(36)}${now.toString(36).slice(-3)}`,
@@ -388,7 +426,8 @@ async function startJob(
     notes: [],
     readOnly: input.readOnly,
   }
-  const finish = (p: Promise<PiJob>) =>
+  noteJob(job, input.task)
+  const finish =(p: Promise<PiJob>) =>
     p.then(done => {
       $.ui.toast(`${chOf(done)} ${done.id} ${done.status === 'done' ? '完成' : '失败'}（${done.model}）`)
       return done
@@ -411,36 +450,6 @@ async function startJob(
 // ---------- router_config 工具 ----------
 
 type ConfigInput = { action?: 'get' | 'set' | 'reset' | 'probe' | 'report'; path?: string; value?: unknown; remove?: boolean; days?: number }
-
-/** 给定时任务这类不能敲斜杠命令的场合用：对照实验、按类别、整体汇总放在一起 */
-async function effectReport($: EngineInterface, days: number): Promise<string> {
-  const from = Date.now() - days * 86_400_000
-  const logs = await readLogs($, from)
-  const cfg = await config($)
-  const s = summarize(logs, from)
-  const overall = {
-    experiment: cfg.experiment,
-    arms: s.arms,
-    savedUsdEstimate: s.savedUsd,
-    cheapUsd: s.cheapUsd,
-    pi: s.pi,
-    weekQuotaPct: s.week,
-    guards: logs.filter(r => r.t === 'guard' && !r.again).length,
-    guardsReleased: logs.filter(r => r.t === 'guard' && r.again).length,
-  }
-  return [
-    `# auto-router 效果（最近 ${days} 天）`,
-    '',
-    '## 对照实验',
-    reportText(experimentReport(logs, from), days),
-    '',
-    '## 按类别（纠正记在被纠正的那一轮）',
-    categoryText(categoryStats(logs, from)),
-    '',
-    '## 整体汇总（JSON）',
-    JSON.stringify(overall, null, 2),
-  ].join('\n')
-}
 
 async function configTool($: EngineInterface, input: ConfigInput): Promise<string> {
   const path = await configPath($, rt.isWindows)
@@ -486,18 +495,43 @@ async function configTool($: EngineInterface, input: ConfigInput): Promise<strin
 
 // ---------- 注册 ----------
 
+/** 冷点按引擎的时钟算（测试里能拨快）；读不到时用本机时间 */
+const nowMs = ($: EngineInterface): Promise<number> => $.clock.now().catch(() => Date.now())
+
+/** 长对话隔太久才回来时，缓存已过期，这一轮要把整段上下文重写进缓存：提醒用户一次，下次可以先开新会话或压缩 */
+const GAP_NOTICE_TOKENS = 100_000
+
+async function gapNotice($: EngineInterface, cfg: Config): Promise<void> {
+  if (!cfg.saver.enabled || !(await saverOn($))) return
+  const mark = await read($, coldMark)
+  const ctx = (await $.session.usage().catch(() => undefined))?.context.tokens ?? 0
+  if (!mark.ts || ctx < GAP_NOTICE_TOKENS) return
+  const idle = (await nowMs($)) - mark.ts
+  if (idle <= cfg.claude.coldGapMinutes * 60_000) return
+  const usd = tokenUsd(lastMainModel ?? 'opus', { in: 0, cw: ctx, cr: 0, out: 0 }, ctx) ?? 0
+  $.ui.toast(
+    `隔了 ${Math.round(idle / 60_000)} 分钟，缓存已过期：这一轮要把 ${Math.round(ctx / 10_000)} 万 token 的上下文整段重写进缓存（约 $${usd.toFixed(2)}）。` +
+      '接下来做别的事就开新会话；还做这件事，可以等这轮答完 /compact，后面每轮都更便宜。',
+  )
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     resetSession(e.cwd)
-    lastCost = undefined
+    // 从会话当前的累计花费起算，第一轮也有花费（新会话是 0，重载插件时是已花的）
+    lastCost = (await $.session.usage().catch(() => undefined))?.cost?.usd
     lastMainModel = undefined
+    lastMainArm = undefined
     ocChecked = false
     await $.command.register({
       name: 'auto-router',
-      description: '模型路由、外派（pi / opencode）与省额度：打开设置面板；pi 配外派模型、stats 看效果、eval 出对照实验报告、run 派任务、export / import 分享配置',
-      argumentHint: '[pi | stats | eval [天数] | jobs | run [角色] <任务> | export [文件] | import <文件> | path]',
+      description: '模型路由、外派（pi / opencode）与省额度：打开设置面板；pi 配外派模型、stats 看效果、eval 出对照实验报告、run 派任务、weekly 设每周报告、doctor 自检、export / import 分享配置',
+      argumentHint: '[pi | stats | eval [天数] | jobs | run [角色] <任务> | weekly [周报目录] | doctor | export [文件] | import <文件> | path]',
     })
     await registerTools($, await config($))
+    // 配置里改了 dataDir：把默认目录里的旧日志搬过去
+    const moved = await moveLogs($).catch(() => 0)
+    if (moved) $.ui.toast(`auto-router 已把 ${moved} 个日志文件搬到新的数据目录 ${await logDir($)}`)
     if (consumeCreated()) {
       rt.firstRun = true
       $.ui.toast('auto-router 已装好：运行 /auto-router，在「外派模型」页按你的订阅配一下外派用哪些模型（pi 和 opencode）')
@@ -537,13 +571,19 @@ export const register: Register = on => {
     const cfg = await config($)
     const hints = await saverHints($, cfg).catch(() => [])
     if (hints.length) e = { ...e, context: [...(e.context ?? []), ...hints] }
+    await gapNotice($, cfg).catch(() => undefined)
     const mode = await read($, modelMode)
     const wantPi = await read($, piAuto)
     if (mode === 'off' && !wantPi) return next(e)
 
     // 配置文件手改后，工具说明里的角色和模型链跟着更新
     await registerTools($, cfg)
-    const decided = await decide($, cfg, e.text, await read($, lastDecision))
+    const prev = await read($, lastDecision)
+    const mark = await read($, coldMark)
+    const ctxNow = (await $.session.usage().catch(() => undefined))?.context.tokens
+    const cold = coldReason(mark, prev, await nowMs($), ctxNow, cfg.claude.coldGapMinutes)
+    if (mark.compacted) await update($, coldMark, m => ({ ...m, compacted: false }))
+    const decided = await decide($, cfg, e.text, prev, cold)
     // 对照组只记下本来会选什么，不切换
     const control = mode === 'auto' && (await sessionTags($)).ra === 'control'
     const decision = control ? { ...decided, control: true } : decided
@@ -591,10 +631,12 @@ export const register: Register = on => {
     if (cost !== undefined) lastCost = cost
     const switched = !sub && lastMainModel !== undefined && family(lastMainModel) !== family(u.model)
     if (!sub) lastMainModel = u.model
+    const arm = sub ? (lastMainArm ?? armOf(mode, d)) : armOf(mode, d)
+    if (!sub) lastMainArm = arm
     await logRecord($, {
       t: 'turn',
       ts: Date.now(),
-      arm: armOf(mode, d),
+      arm,
       cat: d?.label,
       pick: d?.model,
       model: u.model,
@@ -606,6 +648,8 @@ export const register: Register = on => {
       cms: d?.cms,
       via: d?.via,
       fu: d?.fu,
+      cold: d?.cold,
+      rc: d?.rc,
       ctx: usage?.context.tokens,
       in: u.input_tokens,
       cw: u.cache_creation_input_tokens,
@@ -614,6 +658,12 @@ export const register: Register = on => {
       usd,
       wk: usage?.rateLimits.find(r => r.kind === 'seven_day')?.percentUsed,
     })
+    if (!sub) {
+      const ctx = usage?.context.tokens
+      const ts = await nowMs($)
+      await update($, coldMark, m => ({ ...m, ts, ctx }))
+      void writeReport($).catch(() => undefined)
+    }
     return result
   }).catch(($, e, next) => next(e))
 
@@ -632,6 +682,13 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   // 省额度规则写进系统提示；只随配置变，不随轮次变，提示词缓存不受影响
+  // 主对话被压缩后缓存反正要重建：记下来，下一条消息当冷点
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && result.messages) await update($, coldMark, m => ({ ...m, compacted: true }))
+    return result
+  }).catch(($, e, next) => next(e))
+
   on('prompt.compose', async ($, e, next) => {
     const result = await next(e)
     if (!(await saverOn($))) return result
@@ -679,9 +736,15 @@ export const register: Register = on => {
       const cfg = await config($)
       const off = cfg.experiment === 'off' ? '对照实验现在是关着的，下面只统计之前开着时的会话。\n' : ''
       const head = `${armLabel(await sessionTags($))}\n${off}\n`
-      return { text: head + reportText(experimentReport(await readLogs($, from), from), days) }
+      return { text: head + reportText(experimentReport(await readLogs($, from), from, await reportVersion($, cfg)), days) }
     }
-    if (sub === 'path') return { text: `配置文件：${await configPath($, rt.isWindows)}\n效果记录：${await logDir($)}` }
+    if (sub === 'doctor') return { text: await doctor($) }
+    if (sub === 'weekly') return { text: await weeklyHelp($, rest.join(' ')) }
+    if (sub === 'path') {
+      // 顺手把报告文件写一遍，打开就是最新的
+      const md = await writeReport($, true).catch(() => undefined)
+      return { text: `配置文件：${await configPath($, rt.isWindows)}\n效果记录：${await logDir($)}\n效果报告：${md ?? `${await reportDir($)}（写入失败）`}` }
+    }
     if (sub === 'export') {
       const file = rest.join(' ') || 'auto-router.preset.json'
       await $.fs.write(file, JSON.stringify(await config($), null, 2) + '\n')
@@ -702,6 +765,8 @@ export const register: Register = on => {
         opencode: { ...DEFAULT_CONFIG.opencode, ...raw.opencode },
         saver: { ...DEFAULT_CONFIG.saver, ...raw.saver },
         experiment: raw.experiment ?? DEFAULT_CONFIG.experiment,
+        // 数据目录是本机的路径，不跟着别人的配置走
+        dataDir: (await config($)).dataDir,
       }
       // 0.2.x 导出的配置没有 opencode 段，按读配置时一样迁移
       const merged = raw.pi && !raw.opencode ? migrateOpencode(plain).cfg : plain

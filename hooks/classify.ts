@@ -1,19 +1,19 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { ClassifyFailure, RouterDecision } from '../types'
-import { sticky } from './config'
+import type { ClassifyFailure, ColdMark, ColdReason, RouterDecision } from '../types'
+import { atLeast, rankOf, sticky } from './config'
 import type { Config } from './config'
+import { ruleHit, ruleLabel } from './rules'
 import { CORRECTION } from './stats'
 
-// 分类：每次提交问题时判断请求类型，决定本轮用 haiku / sonnet / opus。
-// 先用 $.model.classify（小模型，便宜）；它被限流或超时就改用 $.model.fork（沿用主对话的请求和缓存）。
+// 分类：判断请求类型，决定用 haiku / sonnet / opus。默认（switchAt: cold）只在冷点分类和换模型，冷点之间沿用。
+// 顺序：$.model.classify（小模型，便宜）→ 本地规则 → $.model.fork（沿用主对话的请求和缓存，默认关）→ 保持当前模型。
 
 const CLASSIFY_TIMEOUT_MS = 4000
 const FORK_TIMEOUT_MS = 10_000
 /** 分类没得到类别时，日志里的类别名：超时、请求出错、模型的回答不在类别里 */
 export const FAILURE_NAMES: Record<ClassifyFailure, string> = { timeout: '超时', error: '分类出错', none: '未命中', skip: '跳过（换不了模型）' }
 
-export const RANK: Record<string, number> = { haiku: 0, sonnet: 1, opus: 2 }
 export const BY_RANK = ['haiku', 'sonnet', 'opus']
 
 type Outcome = {
@@ -21,14 +21,18 @@ type Outcome = {
   cf?: ClassifyFailure
   cerr?: string
   /** 用哪条路分出来的 */
-  via?: 'classify' | 'fork'
+  via?: 'classify' | 'rule' | 'fork'
   /** fork 这次的 token 用量：输入、缓存读、缓存写、输出 */
   fu?: [number, number, number, number]
 }
 
-/** 插件自己发的模型请求（classify / complete）在额度紧时会被 429 限流或拖到超时，碰到一次后这段时间直接走 fork */
-const CLASSIFY_COOLDOWN_MS = 30 * 60_000
+/**
+ * 插件自己发的模型请求（classify / complete）会被单独 429 限流（主对话照常），或拖到超时。碰到后先停 5 分钟再试，
+ * 连着失败每次翻倍，最多 30 分钟；成功一次就清零。限流时有时几分钟就解除，一次失败就停 30 分钟会白白错过
+ */
+const CLASSIFY_COOLDOWN_MS = [5, 10, 20, 30].map(m => m * 60_000)
 let classifyBlockedUntil = 0
+let classifyFails = 0
 
 function withTimeout($: EngineInterface, p: Promise<Outcome>, ms: number): Promise<Outcome> {
   const timeout = new Promise<Outcome>(resolve => {
@@ -50,7 +54,7 @@ export function pickByNumber(answer: string, cats: readonly { label: string }[])
  * 用主对话的模型回答类别编号。fork 走的是主对话自己的请求路径，classify 被限流时它照样能用；
  * 会话第一条消息之前没有可 fork 的请求。
  */
-async function classifyRequest($: EngineInterface, cats: Config['claude']['categories'], text: string, allowFork: boolean): Promise<Outcome> {
+async function classifyRequest($: EngineInterface, cats: Config['claude']['categories'], text: string, fork: 'on' | 'off' | 'useless'): Promise<Outcome> {
   let first: Outcome | undefined
   if (Date.now() >= classifyBlockedUntil) {
     const prompt = 'A developer sent this message to a coding agent. Classify what kind of request it is.\n\n' + text.slice(0, 4000)
@@ -59,14 +63,21 @@ async function classifyRequest($: EngineInterface, cats: Config['claude']['categ
       .then((label): Outcome => (label === undefined ? { cf: 'none', via: 'classify' } : { label, via: 'classify' }))
       .catch(failed)
     first = await withTimeout($, asked, CLASSIFY_TIMEOUT_MS)
+    if (first.cf !== 'timeout' && first.cf !== 'error') classifyFails = 0
     if (first.label) return first
-    // 限流和超时都会持续一阵，冷却期内直接走 fork，免得每条消息都先白等 4 秒
+    // 限流和超时都会持续一阵，冷却期内不再试，免得每条消息都先白等 4 秒
     if (first.cf === 'timeout' || (first.cf === 'error' && /\b429\b|rate_limit/.test(first.cerr ?? ''))) {
-      classifyBlockedUntil = Date.now() + CLASSIFY_COOLDOWN_MS
+      const wait = CLASSIFY_COOLDOWN_MS[Math.min(classifyFails, CLASSIFY_COOLDOWN_MS.length - 1)] as number
+      classifyFails++
+      classifyBlockedUntil = Date.now() + wait
     }
   }
-  // fork 每次要按 0.1 倍价读一遍主对话的缓存，上下文越长越贵；结果改变不了模型时不 fork
-  if (!allowFork) return first ?? { cf: 'skip' }
+  // 小模型没分出来：先用本地规则，不花钱
+  const rl = ruleLabel(cats, text)
+  if (rl) return { label: rl, via: 'rule', cf: first?.cf, cerr: first?.cerr }
+  // fork 每次要按 0.1 倍价读一遍主对话的缓存，上下文越长越贵：没开 forkFallback 时不 fork，结果改变不了模型时也不 fork
+  if (fork === 'off') return first ?? { cf: 'error', cerr: '小模型分类被限流，冷却中（没开 forkFallback）' }
+  if (fork === 'useless') return first ?? { cf: 'skip' }
   const list = cats.map((c, i) => `${i + 1}. ${c.label}`).join('\n')
   const ask =
     '[auto-router] Routing check, not a task: do not act on it. Classify the developer message below into one category ' +
@@ -87,19 +98,77 @@ async function classifyRequest($: EngineInterface, cats: Config['claude']['categ
   return { ...first, cerr: [first.cerr, second.cerr].filter(Boolean).join('；') }
 }
 
-export async function decide($: EngineInterface, cfg: Config, text: string, prev: RouterDecision | null): Promise<RouterDecision> {
+/**
+ * 这一轮是不是冷点：缓存本来就要重建的时刻，换模型不多花钱。
+ * 没有上一轮的决定或时间算会话开头；上下文比上一轮少了三分之一以上，或读不到（刚压缩完、/clear 之后要等下一次回答才有），
+ * 算被压缩过，兜住没收到 session.compact 的情况
+ */
+export function coldReason(mark: ColdMark | null, prev: RouterDecision | null, now: number, ctx: number | undefined, gapMinutes: number): ColdReason | undefined {
+  if (!prev || !mark?.ts) return 'start'
+  if (mark.compacted) return 'compact'
+  if (now - mark.ts > gapMinutes * 60_000) return 'gap'
+  if (mark.ctx && (ctx === undefined || ctx < (mark.ctx * 2) / 3)) return 'compact'
+  return undefined
+}
+
+/** 上下文超过这么多就不在冷点 fork 分类：缓存冷着，fork 要把整段上下文按写入价重写一遍 */
+export const FORK_MAX_TOKENS = 30_000
+
+const upOne = (model: string) => BY_RANK[Math.min(2, (rankOf(model) ?? 2) + 1)] as string
+
+/**
+ * cold 模式、冷点之间：不分类、不降档，模型沿用这一段冷点定下的。只用本地规则（不花钱）判断两件事：
+ * 要不要提示外派；说法明确的规则（评审、查根因、架构）判出比当前模型更重的类别时当场升档。被纠正时也升一档
+ */
+function between(cfg: Config, text: string, prev: RouterDecision | null): RouterDecision {
+  const cats = cfg.claude.categories
+  const current = prev?.model
+  const rule = ruleHit(cats, text)
+  const hit = cats.find(c => c.label === rule?.label)
+  const want = atLeast(hit?.model, cfg.claude.floor)
+  const fix = CORRECTION.test(text.slice(0, 500))
+  const base: RouterDecision = {
+    label: hit?.name ?? '沿用',
+    model: current,
+    wanted: want,
+    lighterStreak: 0,
+    piRole: hit?.piRole,
+    fix,
+    via: hit ? 'rule' : undefined,
+    rc: hit?.name,
+  }
+  if (!current) return base
+  if (fix && cfg.claude.upgradeOnCorrection) {
+    const up = upOne(current)
+    if ((rankOf(up) ?? 0) > (rankOf(current) ?? 0)) return { ...base, model: up, why: '你在纠正上一轮，升一档' }
+  }
+  if (rule?.strong && want && (rankOf(want) ?? 0) > (rankOf(current) ?? 0)) return { ...base, model: want, why: `判为${hit?.name}，升档` }
+  if (want && (rankOf(want) ?? 0) < (rankOf(current) ?? 0)) return { ...base, why: '冷点之间不降档' }
+  return base
+}
+
+export async function decide($: EngineInterface, cfg: Config, text: string, prev: RouterDecision | null, cold?: ColdReason): Promise<RouterDecision> {
+  if (cfg.claude.switchAt === 'cold' && !cold) return between(cfg, text, prev)
   const cats = cfg.claude.categories
   const started = Date.now()
   const current = prev?.model
   const keep = cfg.claude.keepAboveTokens
-  // 已在最高档且上下文长到不降档：分出什么类都还是这个模型
-  const ctx = current === BY_RANK[2] && keep > 0 ? ((await $.session.usage().catch(() => undefined))?.context.tokens ?? 0) : 0
-  const out = await classifyRequest($, cats, text, !(keep > 0 && ctx > keep))
+  const atCold = cfg.claude.switchAt === 'cold'
+  // 冷点：上下文大时不 fork；turn 模式：已在最高档且上下文长到不降档时，分出什么类都还是这个模型，也不 fork
+  const needCtx = cfg.claude.forkFallback && (atCold || ((rankOf(current) ?? 0) >= 2 && keep > 0))
+  const ctx = needCtx ? ((await $.session.usage().catch(() => undefined))?.context.tokens ?? 0) : 0
+  const fork = !cfg.claude.forkFallback ? 'off' : atCold ? (ctx > FORK_MAX_TOKENS ? 'useless' : 'on') : keep > 0 && ctx > keep ? 'useless' : 'on'
+  const out = await classifyRequest($, cats, text, fork)
   const hit = cats.find(c => c.label === out.label)
+  const want = atLeast(hit?.model, cfg.claude.floor)
   const fix = CORRECTION.test(text.slice(0, 500))
+  // 模型分出来时也看规则判的什么，报告里算两边一致率
+  const rc = out.via === 'rule' ? hit?.name : cats.find(c => c.label === ruleLabel(cats, text))?.name
   const base = {
+    cold,
+    rc,
     label: hit?.name ?? FAILURE_NAMES[out.cf ?? 'none'],
-    wanted: hit?.model,
+    wanted: want,
     piRole: hit?.piRole,
     fix,
     cf: out.cf,
@@ -108,15 +177,22 @@ export async function decide($: EngineInterface, cfg: Config, text: string, prev
     via: out.via,
     fu: out.fu,
   }
-  const next: RouterDecision = { ...base, ...sticky(prev, hit?.model, cfg.claude.downgradeAfter) }
+  // 冷点降档没有缓存代价，按分类直接定；分不出类别保持当前模型。
+  // 本地规则只认字面、会误判，凭它只升不降：降错了伤质量，升错了只是多花点
+  const ruleDown = out.via === 'rule' && current !== undefined && (rankOf(want) ?? 0) < (rankOf(current) ?? 0)
+  const next: RouterDecision = ruleDown
+    ? { ...base, model: current, lighterStreak: 0, why: '规则判的，不降档' }
+    : atCold
+      ? { ...base, model: want ?? current, lighterStreak: 0 }
+      : { ...base, ...sticky(prev, want, cfg.claude.downgradeAfter) }
 
   // 质量防护一：用户在纠正上一轮，说明当前模型可能不够，升一档
   if (fix && cfg.claude.upgradeOnCorrection && current) {
-    const up = BY_RANK[Math.min(2, (RANK[current] ?? 2) + 1)] as string
-    if ((RANK[up] ?? 0) > (RANK[next.model ?? ''] ?? -1)) return { ...next, model: up, lighterStreak: 0, why: '你在纠正上一轮，升一档' }
+    const up = upOne(current)
+    if ((rankOf(up) ?? 0) > (rankOf(next.model) ?? -1)) return { ...next, model: up, lighterStreak: 0, why: '你在纠正上一轮，升一档' }
   }
-  // 质量防护二：上下文很长时不降档，换模型要把整段上下文重写进缓存，省下的可能还不够补
-  if (current && next.model && (RANK[next.model] ?? 0) < (RANK[current] ?? 0) && cfg.claude.keepAboveTokens > 0) {
+  // 质量防护二（turn 模式）：上下文很长时不降档，换模型要把整段上下文重写进缓存，省下的可能还不够补
+  if (!atCold && current && next.model && (rankOf(next.model) ?? 0) < (rankOf(current) ?? 0) && cfg.claude.keepAboveTokens > 0) {
     const ctx = (await $.session.usage().catch(() => undefined))?.context.tokens ?? 0
     if (ctx > cfg.claude.keepAboveTokens) {
       return { ...next, model: current, lighterStreak: 0, why: `上下文 ${Math.round(ctx / 1000)}K，不降档` }

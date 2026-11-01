@@ -1,9 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { buildRoles, chainFor, DEFAULT_CONFIG, earliestRun, isPeak, liveChain, nextOffPeak, sticky } from '../hooks/config'
-import { summarize } from '../hooks/stats'
-import { piStatus, routeStatus } from '../hooks/statusline'
+import { buildRoles, chainFor, claudeModelsFrom, DEFAULT_CONFIG, earliestRun, isPeak, liveChain, nextOffPeak, sticky, validate } from '../hooks/config'
+import { summarize, tokenUsd } from '../hooks/stats'
+import { modelTag, piStatus, routeStatus } from '../hooks/statusline'
 import type { LogRecord } from '../hooks/stats'
 import type { Config } from '../hooks/config'
 
@@ -216,18 +216,13 @@ test('外派模型页（pi）：显示完整模型名，默认只列在用的；
     props: { title: 'auto-router', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   } as never)
   await ui.press({ key: 'tab-pi' })
-  // 模型和档位在“高级设置”里，默认不展开
-  expect(await ui.find({ type: 'Button', key: 'show-models-on' })).toBeUndefined()
-  await ui.press({ key: 'adv' })
+  // 按通道分组，每家下面直接列出检测到的全部模型，没选档位的也在
   let hit
-  for (let i = 0; i < 30 && !hit; i++) hit = await ui.find({ type: 'Text', text: /^gpt-6\.1-sol$/ })
+  for (let i = 0; i < 30 && !hit; i++) hit = await ui.find({ type: 'Text', text: /^[●○] gpt-6\.1-sol$/ })
   expect(hit).toBeDefined()
-  // 没标档位的 gpt-6.1-mini 先不列，点“显示全部”才出来
-  expect(await ui.find({ type: 'Text', text: /^gpt-6\.1-mini$/ })).toBeUndefined()
-  await ui.press({ key: 'show-models-on' })
-  let mini
-  for (let i = 0; i < 30 && !mini; i++) mini = await ui.find({ type: 'Text', text: /^gpt-6\.1-mini$/ })
-  expect(mini).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^○ gpt-6\.1-mini$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /① pi 通道/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /② opencode 通道/ })).toBeDefined()
 
   // deepseek-flash 标成“不用”：各角色里的 deepseek 自动去掉
   written.length = 0
@@ -365,7 +360,7 @@ test('设置面板：四个标签页在电脑端、终端、手机端都画得�
       props: { title: 'auto-router', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
     } as never)
     for (const [tab, words] of [
-      ['claude', /模型切换/],
+      ['claude', /每类问题用哪个模型/],
       ['pi', /派活顺序/],
       ['stats', /Claude 用量/],
       ['jobs', /还没有任务/],
@@ -412,13 +407,40 @@ test('快速设置：别的用户只有 GPT 按量 + 智谱订阅，也能生成
   expect(built.pi.roles.review?.readOnly).toBe(true)
 })
 
-test('效果统计：从记录反推 Opus 单价，算出小模型省了多少，扣掉换模型的代价', () => {
+test('快速设置：格式整理链里，另一家的免费轻档排在订阅前面', () => {
+  const cfg: Config = {
+    ...DEFAULT_CONFIG,
+    pi: {
+      ...DEFAULT_CONFIG.pi,
+      providers: { ...DEFAULT_CONFIG.pi.providers, 'xfyun-spark': { enabled: true, billing: 'free' } },
+      tiers: { ...DEFAULT_CONFIG.pi.tiers, 'xfyun-spark/spark-x2.6': 'light' },
+    },
+  }
+  const models = buildRoles(cfg).pi.roles.trivial?.models ?? []
+  expect(models.slice(0, 3)).toEqual(['opencode/nemotron-3.5-lightning-free', 'xfyun-spark/spark-x2.6', 'agnes/agnes-2.5-flash'])
+})
+
+test('官方价：缓存写按 2 倍，Haiku 5.5 提示过 10 万换高一档', () => {
+  const M = { in: 1_000_000, cw: 0, cr: 0, out: 0 }
+  expect(tokenUsd('claude-opus-5-5', M)).toBe(4)
+  expect(tokenUsd('claude-opus-5-5', { ...M, in: 0, cw: 1_000_000 })).toBe(8)
+  expect(tokenUsd('claude-sonnet-5-5', { ...M, in: 0, cr: 1_000_000 })).toBe(0.2)
+  expect(tokenUsd('claude-haiku-5-5', M)).toBe(0.1)
+  expect(tokenUsd('claude-haiku-5-5', M, 200_000)).toBe(0.5)
+  expect(tokenUsd('gpt-5', M)).toBeUndefined()
+})
+
+test('效果统计：按官方价算小模型少花多少，换模型重写缓存和 fork 分类单独记', () => {
   const t = (over: Partial<Extract<LogRecord, { t: 'turn' }>>): LogRecord => ({ t: 'turn', ts: 10, arm: 'auto', model: 'claude-opus-5-5', in: 0, cw: 0, cr: 0, out: 0, ...over })
+  const near = (x: number | undefined, y: number) => expect(Math.abs((x ?? NaN) - y)).toBeLessThan(1e-9)
   const s = summarize(
     [
-      t({ in: 1000, usd: 0.5 }), // Opus：每加权 token 0.0005
-      t({ model: 'claude-sonnet-5-5', in: 1000, usd: 0.3, switched: true, cw: 0 }),
-      t({ model: 'claude-haiku-5-5', in: 1000, usd: 0.1, fix: true }),
+      t({ in: 1000, usd: 0.5 }),
+      // 换到 Sonnet：1 万缓存重写。不换的话按读算，重写多花 1 万 ×（4 − 0.2）/ 百万
+      t({ model: 'claude-sonnet-5-5', in: 1000, usd: 0.3, switched: true, cw: 10_000 }),
+      // fork 用上一轮的 Sonnet：读 10 万缓存 0.02；这轮没换模型，fork 写的缓存主对话会读到，不算
+      t({ model: 'claude-haiku-5-5', in: 1000, fix: true, fu: [0, 100_000, 5000, 0] }),
+      t({ model: 'claude-haiku-5-5', in: 10, sub: true, ra: 'control' }), // 0.3.1 之前子代理一律记成 auto
       t({ arm: 'control', in: 2000, usd: 1 }),
       { t: 'pi', ts: 10, role: 'text', model: 'agnes/agnes-3.0-flash', ok: true, ms: 2000 },
       t({ ts: 1, in: 999_999, usd: 99 }), // 窗口外
@@ -428,10 +450,13 @@ test('效果统计：从记录反推 Opus 单价，算出小模型省了多少�
   expect(s.arms.auto?.turns).toBe(3)
   expect(s.arms.auto?.fixes).toBe(1)
   expect(s.arms.auto?.switches).toBe(1)
-  expect(s.arms.control?.turns).toBe(1)
-  expect(Math.round((s.savedUsd ?? 0) * 100)).toBe(60) // (0.5-0.3) + (0.5-0.1)
-  expect(Math.round(s.cheapUsd * 100)).toBe(40)
-  expect(s.pi).toEqual({ total: 1, ok: 1, byModel: { 'agnes/agnes-3.0-flash': 1 }, byChannel: { pi: 1 }, files: 0 })
+  expect(s.arms.control?.turns).toBe(2)
+  near(s.arms.auto?.switchUsd, 0.038)
+  near(s.arms.auto?.forkUsd, 0.02)
+  // 少花：Sonnet 0.006 − 0.004，Haiku 0.004 − 0.0001
+  near(s.savedUsd, 0.0059)
+  near(s.cheapUsd, 0.0041)
+  expect(s.pi).toEqual({ total: 1, ok: 1, routed: 1, routedOk: 1, byModel: { 'agnes/agnes-3.0-flash': 1 }, byChannel: { pi: 1 }, files: 0 })
 })
 
 test('质量防护：说“不对，重做”时升一档，并把这轮记进效果日志', async ($, on) => {
@@ -459,15 +484,26 @@ test('质量防护：说“不对，重做”时升一档，并把这轮记进�
 
   const log = Object.entries(files).find(([p]) => p.includes('abcdef12') && p.endsWith('.jsonl'))?.[1] ?? ''
   const rows = log.trim().split('\n').map(l => JSON.parse(l) as Record<string, unknown>)
-  expect(rows.map(r => r.pick)).toEqual(['haiku', 'sonnet'])
+  // 闲聊按最低档 Sonnet，被纠正升到 Opus
+  expect(rows.map(r => r.pick)).toEqual(['sonnet', 'opus'])
   expect(rows[1]?.fix).toBe(true)
   expect(rows[1]?.switched).toBe(true)
   expect(rows[1]?.wk).toBe(40)
   expect(typeof rows[1]?.usd).toBe('number')
 })
 
-test('质量防护：上下文超过阈值时不降档', async ($, on) => {
-  base(on)
+test('质量防护（每轮切换模式）：上下文超过阈值时不降档', async ($, on) => {
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__auto-router__${e.name}` } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('clock.after', () => new Promise(() => {}))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  // 只有配置文件存在，内容是每轮切换的配置
+  const turnCfg = JSON.stringify({ ...DEFAULT_CONFIG, claude: { ...DEFAULT_CONFIG.claude, switchAt: 'turn' } })
+  on('fs.exists', (_, e) => ({ value: /auto-router\.json$/.test(e.path) }))
+  on('fs.read', (_, e) => (/auto-router\.json$/.test(e.path) ? { value: turnCfg } : { deny: 'ENOENT' }))
+  on('fs.write', () => ({ value: undefined }))
   const cats = DEFAULT_CONFIG.claude.categories
   let label = cats.find(c => c.model === 'opus')?.label as string
   on('model.classify', () => ({ value: label }))
@@ -492,7 +528,7 @@ test('质量防护：上下文超过阈值时不降档', async ($, on) => {
   } as never)
   await ui.press({ key: 'tab-claude' })
   let hit
-  for (let i = 0; i < 20 && !hit; i++) hit = await ui.find({ type: 'Text', text: /上一个问题：闲聊\/简答 → opus/ })
+  for (let i = 0; i < 20 && !hit; i++) hit = await ui.find({ type: 'Text', text: /闲聊\/简答 {2}→ {2}🟣 Opus/ })
   expect(hit).toBeDefined()
 })
 
@@ -506,7 +542,73 @@ test('状态行：颜色圆点标模型，图标标类别、降档缓冲、防�
   expect(routeStatus({ ...base, model: 'opus', why: '你在纠正上一轮，升一档' }, o)).toContain('⬆ 你在纠正')
   expect(routeStatus({ ...base, label: '评审/查根因', model: 'opus', piRole: 'review' }, o)).toContain('🚀 可外派（评审）')
   expect(routeStatus({ ...base, piRole: 'review' }, { ...o, showPi: false })).not.toContain('🚀')
-  expect(routeStatus({ ...base, control: true }, o)).toBe('🧪 对照日  ·  不切换  ·  本来会用 🔵 Sonnet')
+  expect(routeStatus({ ...base, control: true }, o)).toBe('🧪 对照组  ·  不切换  ·  本来会用 🔵 Sonnet')
   expect(routeStatus({ label: '固定', model: 'haiku', lighterStreak: 0 }, o)).toBe('📌 固定  ·  🟢 Haiku')
   expect(piStatus('review', 'openai/gpt-6.1-sol')).toBe('🚀 pi  ·  评审  ·  gpt-6.1-sol 运行中')
+})
+
+test('Claude 具体版本：从 pi 清单挑出来，按系列和版本排；配置里能写完整 id', () => {
+  const list = ['anthropic/claude-haiku-5-5', 'anthropic/claude-opus-4-8', 'anthropic/claude-opus-5-5', 'anthropic/claude-opus-5-5-20260601', 'anthropic/claude-fable-5-1', 'openai/gpt-6.1-sol']
+  expect(claudeModelsFrom(list)).toEqual(['claude-fable-5-1', 'claude-opus-5-5', 'claude-opus-4-8', 'claude-haiku-5-5'])
+  const withModel = (model: string) => ({ ...DEFAULT_CONFIG, claude: { ...DEFAULT_CONFIG.claude, categories: [{ ...DEFAULT_CONFIG.claude.categories[0]!, model }] } })
+  expect(validate(withModel('claude-opus-4-8'))).toEqual([])
+  expect(validate(withModel('fable'))).toEqual([])
+  expect(validate(withModel('gpt-6.1-sol')).join()).toContain('claude- 开头')
+  // 完整 id 也按系列比档：opus 4.8 → haiku 要连续两轮才降
+  let s = sticky(null, 'claude-opus-4-8', 2)
+  s = sticky(s, 'haiku', 2)
+  expect(s).toEqual({ model: 'claude-opus-4-8', lighterStreak: 1 })
+  expect(modelTag('claude-opus-4-8')).toBe('🟣 Opus 4.8')
+  expect(modelTag('fable')).toBe('🟡 Fable')
+})
+
+test('刷新模型列表：Claude 页能选 pi 清单里的具体版本；外派页列出新增的模型让你选档位', async ($, on) => {
+  const written: string[] = []
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__auto-router__${e.name}` } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('clock.after', () => new Promise(() => {}))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.exists', () => ({ value: written.length > 0 }))
+  on('fs.read', () => ({ value: written[written.length - 1] ?? '' }))
+  on('fs.write', (_, e) => {
+    written.push(String(e.text))
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  const rows = ['provider  model  context', 'openai  gpt-6.1-sol  272K', 'anthropic  claude-opus-4-8  1M', 'anthropic  claude-sonnet-5-5  1M']
+  on('process.run', (_, e) => ok(e.argv.includes('--list-models') ? rows.join('\n') : 'C:\\Users\\me\r\n'))
+  await $.session.start({ cwd: 'D:\\work', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: 'auto-router',
+    component: 'Pane',
+    requestId: 'auto-router',
+    surface: 'mobile',
+    props: { title: 'auto-router', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  } as never)
+  const until = async (q: Parameters<typeof ui.find>[0]) => {
+    let hit
+    for (let i = 0; i < 50 && !hit; i++) hit = await ui.find(q)
+    return hit
+  }
+
+  // Claude 页：刷新后出现“固定”的具体版本，选了写进配置
+  await ui.press({ key: 'refresh-claude' })
+  expect(await until({ type: 'Button', key: 'cm-0-claude-opus-4-8' })).toBeDefined()
+  written.length = 0
+  await ui.press({ key: 'cm-0-claude-opus-4-8' })
+  const cats = () => JSON.parse(written[written.length - 1] ?? '{}').claude?.categories
+  for (let i = 0; i < 50 && !cats(); i++) await ui.findAll({})
+  expect(cats()[0].model).toBe('claude-opus-4-8')
+
+  // 外派页：pi 新上了一个模型，刷新后在 ① 里直接选档位
+  await ui.press({ key: 'tab-pi' })
+  expect(await until({ type: 'Text', text: /刷新：/ })).toBeDefined()
+  rows.push('openai  gpt-7-preview  400K')
+  await ui.press({ key: 'refresh-models' })
+  expect(await until({ type: 'Text', text: /多了 1 个/ })).toBeDefined()
+  expect(await until({ type: 'Button', key: 'tier-openai/gpt-7-preview-none' })).toBeDefined()
+  await ui.unmount()
 })

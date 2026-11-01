@@ -4,7 +4,7 @@ import type { TestBody } from 'claude-code/testing'
 import { DEFAULT_CONFIG } from '../hooks/config'
 import type { Config } from '../hooks/config'
 import { countLines, crossedLevel, firstTime, fromBase64, imageDims, normPath, rulesText, shellTargets } from '../hooks/saver'
-import { experimentReport, forkUsd, MIN_SESSIONS, reportText, sessionArms, unitPrices } from '../hooks/stats'
+import { experimentReport, forkUsd, MIN_SESSIONS, reportText, sessionArms } from '../hooks/stats'
 import type { LogRecord, TurnRecord } from '../hooks/stats'
 
 type On = Parameters<TestBody>[1]
@@ -183,15 +183,14 @@ test('评测报告 fork 分类在切换组花费里的占比：fork 按上一轮
     mk('c1', 'control', 1, 'claude-opus-5-5'),
     mk('c1', 'control', 2, 'claude-opus-5-5'),
   ]
-  const price = unitPrices(rows as TurnRecord[])
-  // 第二轮的 fork 发生在切换前，按 opus 计价：缓存读 1 万是一轮 opus（10 万）的十分之一
-  expect(Math.abs(forkUsd([0, 10_000, 0, 0], 'claude-opus-5-5', price) - 0.005)).toBeLessThan(1e-9)
+  // 第二轮的 fork 发生在切换前，按 Opus 官方价：缓存读 1 万 × 0.2 / 百万
+  expect(Math.abs(forkUsd([0, 10_000, 0, 0], 'claude-opus-5-5') - 0.002)).toBeLessThan(1e-9)
   const rep = experimentReport(rows, 0)
   const ef = rep.effects.find(e => e.factor === 'route')
   expect(Math.abs((ef?.on.usd ?? 0) - 0.11)).toBeLessThan(1e-9)
-  expect(Math.abs((ef?.on.forkShare ?? 0) - 0.005 / 0.11)).toBeLessThan(1e-9)
+  expect(Math.abs((ef?.on.forkShare ?? 0) - 0.002 / 0.11)).toBeLessThan(1e-9)
   expect(ef?.off.forkShare).toBe(0)
-  expect(reportText(rep, 7)).toContain('fork 分类约占切换组花费的 5%')
+  expect(reportText(rep, 7)).toContain('fork 分类约占切换组花费的 2%')
 })
 
 test('实验报告：不到 3 轮的会话不算；和别的会话同时开的不算额度涨幅；外派次数单列', () => {

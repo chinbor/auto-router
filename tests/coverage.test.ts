@@ -1,11 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { DEFAULT_CONFIG } from '../hooks/config'
+import { DEFAULT_CONFIG, liveChain } from '../hooks/config'
 import type { Config } from '../hooks/config'
-import { pickByNumber } from '../hooks/classify'
+import { coldReason, pickByNumber } from '../hooks/classify'
+import { ruleLabel } from '../hooks/rules'
 import { imageDims } from '../hooks/saver'
-import { categoryStats, categoryText, modelVersions, sessionArms, versionLabel } from '../hooks/stats'
+import { categoryStats, categoryText, cellStats, costSplit, costSplitText, summarize, configVersion, demotedModels, modelVersions, overlap, redoStats, redoText, sessionArms, sessionStats, taskWords, versionLabel } from '../hooks/stats'
 import type { LogRecord } from '../hooks/stats'
 
 type On = Parameters<TestBody>[1]
@@ -27,7 +28,7 @@ type Harness = { files: Record<string, string>; sizes: Record<string, number>; b
  * 引擎替身：files 是磁盘（配置、日志都在里面，写入也落在这里），sizes 给 fs.stat 用，bytes 给按字节读用。
  * 配置文件按 cfg 预置；目录列表从 files 里推出来。
  */
-function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: string; ctx?: number; wk?: number } = {}): Harness {
+function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: string; ctx?: number | (() => number); wk?: number; toasts?: string[]; now?: () => number } = {}): Harness {
   const h: Harness = { files: {}, sizes: {}, bytes: {} }
   if (opts.cfg) h.files.CFG = JSON.stringify(opts.cfg)
   // 配置文件和日志目录的真实位置从插件目录推出来，这里统一换成 CFG、LOG 两个键
@@ -40,13 +41,17 @@ function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: s
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('tool.register', (_, e) => ({ value: { tool: `mcp__auto-router__${e.name}` } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => {
+    opts.toasts?.push(e.text)
+    return { value: undefined }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('clock.after', () => new Promise(() => {}))
+  on('clock.now', () => ({ value: opts.now?.() ?? Date.now() }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: 'C:\\Users\\me\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('session.id', () => ({ value: opts.sid ?? SID }))
   on('session.usage', () => ({
-    value: { startedAt: 0, context: { tokens: opts.ctx ?? 5000, window: 1_000_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: opts.wk ?? 10 }], cost: { usd: 0 } },
+    value: { startedAt: 0, context: { tokens: (typeof opts.ctx === 'function' ? opts.ctx() : opts.ctx) ?? 5000, window: 1_000_000 }, rateLimits: [{ kind: 'seven_day', percentUsed: opts.wk ?? 10 }], cost: { usd: 0 } },
   }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('fs.exists', (_, e) => {
@@ -102,6 +107,10 @@ function sidWith(exp: 'route' | 'saver' | 'both', want: { ra?: 'auto' | 'control
 }
 
 const RATE_LIMITED = 'auto-router: $.model.classify: the request failed (HTTP 429, rate_limit)'
+/** 每轮都分类的旧做法（switchAt: turn），分类链的测试用它，每条消息都会走一遍分类 */
+const TURN = { ...DEFAULT_CONFIG, claude: { ...DEFAULT_CONFIG.claude, switchAt: 'turn' as const } }
+/** 每轮分类，并打开“分类失败时 fork”（默认关） */
+const FORK_ON = { ...TURN, claude: { ...TURN.claude, forkFallback: true } }
 
 // ---------- 分类器 ----------
 
@@ -114,8 +123,8 @@ test('fork 的回答按编号对应类别', () => {
   expect(pickByNumber('coding task', cats)).toBeUndefined()
 })
 
-test('classify 被 429 限流时改用 fork，之后 30 分钟直接走 fork', async ($, on) => {
-  const h = harness(on, { cfg: DEFAULT_CONFIG })
+test('classify 被 429 限流时改用 fork，之后冷却几分钟（连着失败逐步加长）直接走 fork', async ($, on) => {
+  const h = harness(on, { cfg: FORK_ON })
   let classifyCalls = 0
   let forkCalls = 0
   on('model.classify', () => {
@@ -127,9 +136,9 @@ test('classify 被 429 限流时改用 fork，之后 30 分钟直接走 fork', a
     return { value: { isAnswered: true, text: '7', usage: USAGE } }
   })
   await start($)
-  await submit($, '把 200 个文件的 import 改成别名')
+  await submit($, '200 个文件的 import 都要用别名')
   await complete($)
-  await submit($, '再把测试也改了')
+  await submit($, '测试也一样')
   await complete($)
 
   expect(classifyCalls).toBe(1)
@@ -139,6 +148,26 @@ test('classify 被 429 限流时改用 fork，之后 30 分钟直接走 fork', a
   expect(rows.map(r => r.via)).toEqual(['fork', 'fork'])
   expect(rows[0]?.fu).toEqual([10, 1000, 0, 3])
   expect(rows[0]?.pick).toBe('sonnet')
+})
+
+test('默认不 fork：classify 被限流、规则也判不出时如实记原因，保持当前模型，不花 fork 的钱', async ($, on) => {
+  const h = harness(on, { cfg: TURN })
+  let forkCalls = 0
+  on('model.classify', () => ({ deny: RATE_LIMITED }))
+  on('model.fork', () => {
+    forkCalls++
+    return { value: { isAnswered: true, text: '7', usage: USAGE } }
+  })
+  await start($)
+  await submit($, '这里的 import 怎么写比较好')
+  await complete($)
+  await submit($, '测试那边也看看')
+  await complete($)
+  expect(forkCalls).toBe(0)
+  const rows = logRows(h)
+  expect(rows.map(r => r.cf)).toEqual(['error', 'error'])
+  expect(String(rows[1]?.cerr)).toContain('冷却中')
+  expect(rows[0]?.pick).toBeUndefined()
 })
 
 test('classify 正常时不 fork', async ($, on) => {
@@ -157,13 +186,13 @@ test('classify 正常时不 fork', async ($, on) => {
 })
 
 test('两条路都失败时如实记下原因，不切换模型', async ($, on) => {
-  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  const h = harness(on, { cfg: FORK_ON })
   on('model.classify', () => {
     return { deny: RATE_LIMITED }
   })
   on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork' } }))
   await start($)
-  await submit($, '你好')
+  await submit($, '看下这个')
   await complete($)
   const row = logRows(h)[0] ?? {}
   expect(row.cat).toBe('分类出错')
@@ -174,19 +203,19 @@ test('两条路都失败时如实记下原因，不切换模型', async ($, on) 
 })
 
 test('fork 答非所问时记为未命中', async ($, on) => {
-  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  const h = harness(on, { cfg: FORK_ON })
   on('model.classify', () => {
     return { deny: RATE_LIMITED }
   })
   on('model.fork', () => ({ value: { isAnswered: true, text: 'a coding task', usage: USAGE } }))
   await start($)
-  await submit($, '实现登录功能')
+  await submit($, '登录这块你来弄')
   await complete($)
   expect(logRows(h)[0]).toMatchObject({ cat: '未命中', cf: 'none' })
 })
 
 test('已在 Opus 且上下文长到不降档时不 fork：分类结果改变不了模型', async ($, on) => {
-  const h = harness(on, { cfg: DEFAULT_CONFIG, ctx: 200_000 })
+  const h = harness(on, { cfg: FORK_ON, ctx: 200_000 })
   let classifyCalls = 0
   let forkCalls = 0
   on('model.classify', () => (++classifyCalls === 1 ? { value: DEFAULT_CONFIG.claude.categories[4]?.label } : { deny: RATE_LIMITED }))
@@ -197,7 +226,7 @@ test('已在 Opus 且上下文长到不降档时不 fork：分类结果改变不
   await start($)
   await submit($, '实现登录功能')
   await complete($)
-  await submit($, '你好')
+  await submit($, '看下这个')
   await complete($)
   // 第三条 classify 在冷却期，直接判定跳过，不再等 classify
   await submit($, '再看看')
@@ -211,7 +240,7 @@ test('已在 Opus 且上下文长到不降档时不 fork：分类结果改变不
 })
 
 test('上下文短时照常 fork', async ($, on) => {
-  const h = harness(on, { cfg: DEFAULT_CONFIG, ctx: 50_000 })
+  const h = harness(on, { cfg: FORK_ON, ctx: 50_000 })
   let forkCalls = 0
   on('model.classify', () => ({ deny: RATE_LIMITED }))
   on('model.fork', () => {
@@ -219,9 +248,9 @@ test('上下文短时照常 fork', async ($, on) => {
     return { value: { isAnswered: true, text: '1', usage: USAGE } }
   })
   await start($)
-  await submit($, '实现登录功能')
+  await submit($, '登录这块你来弄')
   await complete($)
-  await submit($, '你好')
+  await submit($, '看下这个')
   await complete($)
   expect(forkCalls).toBe(2)
   expect(logRows(h).every(r => r.via === 'fork')).toBe(true)
@@ -424,7 +453,7 @@ test('新会话入组：日志打上实验标记，对照组只分类不切换',
   await start($)
   await submit($, '你好')
   await complete($)
-  expect(logRows(h, sid)[0]).toMatchObject({ ex: 'both', ra: 'control', sv: 'off', arm: 'control', pick: 'haiku' })
+  expect(logRows(h, sid)[0]).toMatchObject({ ex: 'both', ra: 'control', sv: 'off', arm: 'control', pick: 'sonnet' })
 })
 
 // ---------- 面板与命令 ----------
@@ -460,15 +489,19 @@ for (const surface of ['mobile', 'desktop'] as const) {
   })
 }
 
-test('/auto-router eval：带本会话分组和报告', async ($, on) => {
+test('/auto-router eval：带本会话分组和报告；只比当前配置版本，旧版本单列', async ($, on) => {
   const sid = sidWith('saver', { sv: 'on' })
-  const h = harness(on, { cfg: { ...DEFAULT_CONFIG, experiment: 'saver' }, sid })
+  const cfg = { ...DEFAULT_CONFIG, experiment: 'saver' as const }
+  const h = harness(on, { cfg, sid })
   const now = Date.now()
   const rows: string[] = []
-  for (let s = 0; s < 3; s++)
-    for (const sv of ['on', 'off'])
-      for (let i = 0; i < 3; i++)
-        rows.push(JSON.stringify({ t: 'turn', ts: now - 1000 + i, arm: 'auto', model: 'claude-opus-5-5', in: 1, cw: 0, cr: 0, out: 1, usd: sv === 'on' ? 0.1 : 0.2, sid: `${sv}${s}`, ex: 'saver', sv }))
+  // 测试里读不到 plugin.json，插件版本记成 ?
+  const cv = configVersion(cfg, '?')
+  for (const ver of [cv, undefined])
+    for (let s = 0; s < 3; s++)
+      for (const sv of ['on', 'off'])
+        for (let i = 0; i < 3; i++)
+          rows.push(JSON.stringify({ t: 'turn', ts: now - (ver ? 1000 : 9000) + i, arm: 'auto', model: 'claude-opus-5-5', in: 1, cw: 0, cr: 0, out: 1, usd: sv === 'on' ? 0.1 : 0.2, sid: `${ver ? 'n' : 'o'}${sv}${s}`, ex: 'saver', sv, cv: ver }))
   h.files['LOG\\2026-10-30_older.jsonl'] = rows.join('\n') + '\n'
   on('command.run', (_, e) => ({ text: e.args }))
   await start($)
@@ -476,7 +509,129 @@ test('/auto-router eval：带本会话分组和报告', async ($, on) => {
   const text = String((out as { text?: string }).text)
   expect(text).toContain('本会话：省额度开')
   expect(text).toContain('【省额度】样本还不够')
-  expect(text).toContain('6 个会话')
+  expect(text).toContain(`6 个会话，只比配置版本 ${cv}）`)
+  expect(text).toContain('0.3.1 之前（没记版本）')
+  expect(text).toContain('6 个会话；省额度 开 3 个 $0.300 / 关 3 个 $0.600')
+  expect(text).toContain(`${cv}  `)
+  expect(text).toContain('← 当前')
+})
+
+test('配置版本：只随影响切换、省额度的配置变；dataDir 改了旧日志搬过去，核对后删旧文件', async ($, on) => {
+  const base = configVersion(DEFAULT_CONFIG, '0.3.1')
+  expect(base).toMatch(/^0\.3\.1-[0-9a-f]{6}$/)
+  expect(configVersion({ ...DEFAULT_CONFIG, pi: { ...DEFAULT_CONFIG.pi, timeoutMinutes: 1 } }, '0.3.1')).toBe(base)
+  expect(configVersion({ ...DEFAULT_CONFIG, claude: { ...DEFAULT_CONFIG.claude, downgradeAfter: 2 } }, '0.3.1')).not.toBe(base)
+  expect(configVersion(DEFAULT_CONFIG, '0.3.2')).not.toBe(base)
+
+  const h = harness(on, { cfg: { ...DEFAULT_CONFIG, dataDir: 'E:\\data' } })
+  on('command.run', (_, e) => ({ text: e.args }))
+  h.files['LOG\\2026-10-30_aaaa.jsonl'] = '{"t":"turn","ts":2}\n{"t":"turn","ts":3}\n'
+  h.files['E:\\data\\log\\2026-10-30_aaaa.jsonl'] = '{"t":"turn","ts":1}\n{"t":"turn","ts":2}\n'
+  await start($)
+  expect(h.files['E:\\data\\log\\2026-10-30_aaaa.jsonl']).toBe('{"t":"turn","ts":1}\n{"t":"turn","ts":2}\n{"t":"turn","ts":3}\n')
+  // 删旧文件走 process.run（$.fs 没有删除）；测试里不真删，再搬一次也不会重复
+  await start($)
+  expect(h.files['E:\\data\\log\\2026-10-30_aaaa.jsonl']).toBe('{"t":"turn","ts":1}\n{"t":"turn","ts":2}\n{"t":"turn","ts":3}\n')
+
+  // 报告文件写在 dataDir\report 下，md 给人和 agent 读，json 给脚本
+  const out = String(((await $.command.run({ command: 'auto-router', args: 'path' } as never)) as { text?: string }).text)
+  expect(out).toContain('效果报告：E:\\data\\report\\latest.md')
+  expect(h.files['E:\\data\\report\\latest.md']).toMatch(/^# auto-router 效果报告[\s\S]*## 最近 7 天[\s\S]*## 最近的改动（CHANGELOG）/)
+  const json = JSON.parse(h.files['E:\\data\\report\\latest.json'] as string) as { configVersion: string; week: { experiment: { versions: unknown[] } } }
+  expect(json.configVersion).toBe(configVersion({ ...DEFAULT_CONFIG, dataDir: 'E:\\data' }, '?'))
+  expect(Array.isArray(json.week.experiment.versions)).toBe(true)
+})
+
+test('快速开始：第一次打开显示四步引导，点“设好了”后收起并记住', async ($, on) => {
+  harness(on, { cfg: DEFAULT_CONFIG })
+  const store: Record<string, unknown> = {}
+  on('store.get', (_, e) => ({ value: store[(e as { key: string }).key] }))
+  on('store.set', (_, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    store[key] = value
+    return { value: undefined }
+  })
+  on('command.run', (_, e) => ({ text: e.args }))
+  await start($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' } as never)
+  await ui.press({ key: 'tab-claude' })
+  let card
+  for (let i = 0; i < 30 && !card; i++) card = await ui.find({ type: 'Text', text: /快速开始/ })
+  expect(card).toBeDefined()
+  await ui.press({ key: 'onboard-done' })
+  for (let i = 0; i < 30 && store.onboarded !== true; i++) await ui.findAll({})
+  expect(store.onboarded).toBe(true)
+  let gone = false
+  for (let i = 0; i < 30 && !gone; i++) gone = !(await ui.find({ type: 'Text', text: /🚀 快速开始/ }))
+  expect(gone).toBe(true)
+  await ui.unmount()
+})
+
+test('/auto-router weekly 给出指向报告目录里说明文件的提示词；doctor 逐项自检', async ($, on) => {
+  const h = harness(on, { cfg: { ...DEFAULT_CONFIG, dataDir: 'E:\\data' } })
+  on('command.run', (_, e) => ({ text: e.args }))
+  await start($)
+  const run = async (args: string) => String(((await $.command.run({ command: 'auto-router', args } as never)) as { text?: string }).text)
+  const weekly = await run('weekly')
+  expect(weekly).toContain('E:\\data\\report\\weekly-report-guide.md')
+  expect(weekly).toContain('E:\\data\\weekly')
+  expect(h.files['E:\\data\\report\\latest.md']).toBeDefined()
+  expect(await run('weekly F:\\周报')).toContain('F:\\周报')
+  const doc = await run('doctor')
+  expect(doc).toMatch(/✓ 配置 .*版本/)
+  expect(doc).toMatch(/✓ 数据目录/)
+  // 分类：只数试过分类的轮次；小模型被限流但规则顶上的不算失败，冷点之间没分类的不算
+  const day = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)
+  const row = (over: Record<string, unknown>) => JSON.stringify({ t: 'turn', ts: Date.now() - 1000, model: 'claude-sonnet-5-5', in: 0, cw: 0, cr: 0, out: 0, usd: 0, ...over })
+  h.files[`E:\\data\\log\\${day}_abcdef12.jsonl`] = [
+    ...Array.from({ length: 4 }, () => row({ cf: 'error', via: 'rule' })),
+    row({ via: 'classify' }),
+    row({ cf: 'timeout' }),
+    ...Array.from({ length: 10 }, () => row({})),
+  ].join('\n') + '\n'
+  const doc2 = await run('doctor')
+  expect(doc2).toContain('✓ 最近 6 次分类里小模型失败 5 次，4 次用本地规则顶上')
+})
+
+test('外派返工：相似任务判得出，返工记在上一次的模型上，返工率高的排到角色链后面', () => {
+  const a = taskWords('修复 hooks/core.ts 里日志分段写的 bug，并补测试')
+  expect(overlap(a, taskWords('hooks/core.ts 日志分段写的 bug 没修好，重新修复并补测试'))).toBeGreaterThanOrEqual(0.5)
+  expect(overlap(a, taskWords('把 README 翻译成英文'))).toBeLessThan(0.2)
+
+  const pi = (model: string, ok: boolean, redo?: string): LogRecord => ({ t: 'pi', ts: 10, role: 'code', model, ok, ms: 1, redo })
+  const rows = redoStats([...Array.from({ length: 5 }, () => pi('a/x', true)), pi('a/x', true, 'a/x'), pi('b/y', true, 'a/x'), pi('b/y', true)], 0)
+  expect(rows.find(r => r.model === 'a/x')).toEqual({ model: 'a/x', ok: 6, redo: 2 })
+  expect([...demotedModels(rows)]).toEqual(['a/x'])
+  expect(redoText(rows)).toContain('a/x：完成 6 个，返工 2 次（33%），已排到角色链后面')
+
+  const code = DEFAULT_CONFIG.pi.roles.code?.models ?? []
+  const first = code[0] as string
+  const live = liveChain(DEFAULT_CONFIG, 'code', Date.UTC(2026, 9, 31, 18), () => false, () => false, new Set([first]))
+  expect(live.models[live.models.length - 1]).toBe(first)
+})
+
+test('日志分段写：一段写满 400 行换 -2 文件，满的那段不再重写', async ($, on) => {
+  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[0]?.label }))
+  const day = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)
+  const full = Array.from({ length: 400 }, (_, i) => JSON.stringify({ t: 'turn', ts: i + 1, arm: 'auto', model: 'm', in: 1, cw: 0, cr: 0, out: 1 })).join('\n') + '\n'
+  const first = `LOG\${day}_${SID.slice(0, 8)}.jsonl`
+  h.files[first] = full
+  await start($)
+  await submit($, '你好')
+  await complete($)
+  expect(h.files[first]).toBe(full)
+  const next = h.files[`LOG\${day}_${SID.slice(0, 8)}-2.jsonl`] ?? ''
+  expect(next.trim().split('\n').length).toBe(1)
+})
+
+test('分类失败率：限流、超时的主对话轮次算进去，未命中和子代理不算', () => {
+  const turn = (i: number, extra: Record<string, unknown>): LogRecord =>
+    ({ t: 'turn', ts: i, arm: 'auto', model: 'm', in: 1, cw: 0, cr: 0, out: 1, usd: 0.1, sid: 's1', ex: 'route', ra: 'auto', ...extra }) as LogRecord
+  const rows = [turn(1, { cf: 'error' }), turn(2, { cf: 'timeout' }), turn(3, { cf: 'none' }), turn(4, {}), turn(5, { cf: 'error', sub: true })]
+  const s = sessionStats(rows)
+  expect(s[0]?.cfails).toBe(2)
+  expect(cellStats(s).cfailRate).toBe(0.5)
 })
 
 test('按类别统计：纠正记在被纠正的上一轮，按切换组分开，子代理不算', () => {
@@ -507,4 +662,193 @@ test('版本号：取各档最近一次实际用到的模型 id', () => {
   expect(versionLabel('opus', v.opus)).toBe('Opus 5.5')
   expect(versionLabel('sonnet', v.sonnet)).toBe('Sonnet')
   expect(versionLabel('opus', 'claude-opus-5-5[1m]')).toBe('Opus 5.5')
+})
+
+// ---------- 冷点切换（switchAt: cold，默认） ----------
+
+test('冷点判断：会话开头、隔太久、压缩过（事件或上下文骤减），其余不是冷点', () => {
+  const prev = { label: '编码', model: 'sonnet', lighterStreak: 0 }
+  const now = 10 * 3600_000
+  expect(coldReason({}, prev, now, 5000, 60)).toBe('start')
+  expect(coldReason({ ts: now - 1000, ctx: 5000 }, null, now, 5000, 60)).toBe('start')
+  expect(coldReason({ ts: now - 1000, ctx: 5000, compacted: true }, prev, now, 5000, 60)).toBe('compact')
+  expect(coldReason({ ts: now - 61 * 60_000, ctx: 5000 }, prev, now, 5000, 60)).toBe('gap')
+  expect(coldReason({ ts: now - 6 * 60_000, ctx: 5000 }, prev, now, 5000, 5)).toBe('gap')
+  expect(coldReason({ ts: now - 1000, ctx: 90_000 }, prev, now, 20_000, 60)).toBe('compact')
+  expect(coldReason({ ts: now - 1000, ctx: 90_000 }, prev, now, undefined, 60)).toBe('compact')
+  expect(coldReason({ ts: now - 1000, ctx: 90_000 }, prev, now, 95_000, 60)).toBeUndefined()
+})
+
+test('本地规则：明确的说法判出类别，含糊的和压缩续接消息判不出', () => {
+  const cats = DEFAULT_CONFIG.claude.categories
+  const name = (t: string) => cats.find(c => c.label === ruleLabel(cats, t))?.name
+  expect(name('你好')).toBe('闲聊/简答')
+  expect(name('帮我评审一下这个 diff')).toBe('评审/查根因')
+  expect(name('你觉得有必要改吗')).toBe('难题/设计')
+  expect(name('实现登录功能')).toBe('编码')
+  expect(name('提交')).toBe('小改动/查找')
+  expect(name('批量把 import 改成别名')).toBe('批量修改')
+  expect(name('再看看')).toBeUndefined()
+  expect(name('This session is being continued from a previous conversation… 实现登录功能')).toBeUndefined()
+  // 用户改掉了某一类的 label，那一类就没有规则
+  expect(ruleLabel(cats.filter(c => c.name !== '编码'), '实现登录功能')).toBeUndefined()
+})
+
+test('冷点模式：只在会话开头分类定模型；冷点之间不分类、不降档，规则判出重活时当场升档', async ($, on) => {
+  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  let classifyCalls = 0
+  on('model.classify', () => {
+    classifyCalls++
+    return { value: DEFAULT_CONFIG.claude.categories[3]?.label }
+  })
+  await start($)
+  await submit($, '登录这块你来弄')
+  await complete($, 'claude-sonnet-5-5')
+  await submit($, '好的')
+  await complete($, 'claude-sonnet-5-5')
+  await submit($, '帮我评审一下改动')
+  await complete($, 'claude-opus-5-5')
+  await submit($, '再看看')
+  await complete($, 'claude-opus-5-5')
+  expect(classifyCalls).toBe(1)
+  const rows = logRows(h)
+  expect(rows[0]).toMatchObject({ cold: 'start', cat: '编码', via: 'classify', pick: 'sonnet' })
+  // 规则判为闲聊，但冷点之间不降档
+  expect(rows[1]).toMatchObject({ cat: '闲聊/简答', via: 'rule', pick: 'sonnet' })
+  expect(rows[1]?.cold).toBeUndefined()
+  // 规则判为评审：升到 Opus；之后判不出类别，沿用 Opus
+  expect(rows[2]).toMatchObject({ cat: '评审/查根因', pick: 'opus' })
+  expect(rows[3]).toMatchObject({ cat: '沿用', pick: 'opus' })
+})
+
+test('冷点模式：小模型被限流时用本地规则顶上，不算分类失败', async ($, on) => {
+  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  on('model.classify', () => ({ deny: RATE_LIMITED }))
+  await start($)
+  await submit($, '实现登录功能')
+  await complete($, 'claude-sonnet-5-5')
+  const rows = logRows(h)
+  expect(rows[0]).toMatchObject({ cold: 'start', cat: '编码', via: 'rule', cf: 'error', pick: 'sonnet' })
+  expect(sessionStats(rows.map(r => ({ ...r, ex: 'route', sid: 's1' }) as LogRecord))[0]?.cfails).toBe(0)
+})
+
+test('效果统计：冷点上换模型不算缓存重写；冷点、升档次数和规则一致率进报告', () => {
+  const t = (i: number, over: Record<string, unknown>): LogRecord =>
+    ({ t: 'turn', ts: i, arm: 'auto', model: 'claude-sonnet-5-5', in: 0, cw: 0, cr: 0, out: 0, usd: 0.1, sid: 's1', ex: 'route', ra: 'auto', ...over }) as LogRecord
+  const rows = [
+    t(1, { cold: 'start', cw: 10_000, cat: '编码', rc: '编码', via: 'classify' }),
+    t(2, { model: 'claude-opus-5-5', switched: true, cw: 10_000, cat: '评审/查根因', via: 'rule' }),
+    t(3, { model: 'claude-haiku-5-5', switched: true, cold: 'gap', cw: 10_000, cat: '闲聊/简答', rc: '编码', via: 'classify' }),
+  ]
+  const s = summarize(rows, 0)
+  expect(s.arms.auto?.switches).toBe(2)
+  expect(s.arms.auto?.coldSwitches).toBe(1)
+  // 只有第 2 轮（冷点之间升档）算重写：1 万 ×（Opus 写 − 读）
+  const opusOnly = summarize([rows[0] as LogRecord, rows[1] as LogRecord], 0).arms.auto?.switchUsd ?? 0
+  expect(opusOnly).toBeGreaterThan(0)
+  expect(s.arms.auto?.switchUsd).toBe(opusOnly)
+  const c = cellStats(sessionStats(rows))
+  expect(Math.abs(c.coldRate - 2 / 3)).toBeLessThan(1e-9)
+  expect(c.coldSwitches).toBe(1)
+  expect(c.midSwitches).toBe(1)
+  expect(c.ruleN).toBe(2)
+  expect(c.ruleAgree).toBe(0.5)
+})
+
+test('最低档：闲聊分类在冷点上也只降到 Sonnet；最低档改成 Haiku 才用 Haiku', async ($, on) => {
+  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[0]?.label }))
+  await start($)
+  await submit($, '今天过得怎么样')
+  await complete($, 'claude-sonnet-5-5')
+  expect(logRows(h)[0]).toMatchObject({ cold: 'start', cat: '闲聊/简答', pick: 'sonnet' })
+})
+
+test('最低档设成 Haiku 时，闲聊照旧用 Haiku', async ($, on) => {
+  const h = harness(on, { cfg: { ...DEFAULT_CONFIG, claude: { ...DEFAULT_CONFIG.claude, floor: 'haiku' } } })
+  on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[0]?.label }))
+  await start($)
+  await submit($, '今天过得怎么样')
+  await complete($, 'claude-haiku-5-5')
+  expect(logRows(h)[0]).toMatchObject({ cold: 'start', pick: 'haiku' })
+})
+
+test('冷点之间：问看法这类口头语判出难题也不升档，只有说法明确的才升', async ($, on) => {
+  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[3]?.label }))
+  await start($)
+  await submit($, '登录这块你来弄')
+  await complete($, 'claude-sonnet-5-5')
+  await submit($, '你觉得好就行')
+  await complete($, 'claude-sonnet-5-5')
+  await submit($, '设计一下缓存模块的接口')
+  await complete($, 'claude-opus-5-5')
+  const rows = logRows(h)
+  expect(rows[1]).toMatchObject({ cat: '难题/设计', pick: 'sonnet' })
+  expect(rows[2]).toMatchObject({ cat: '难题/设计', pick: 'opus' })
+})
+
+test('冷点上规则判出更轻的类别也不降档：规则没把握到能省这一步', async ($, on) => {
+  let ctx = 5000
+  const h = harness(on, { cfg: DEFAULT_CONFIG, ctx: () => ctx })
+  let n = 0
+  on('model.classify', () => (n++ === 0 ? { value: DEFAULT_CONFIG.claude.categories[5]?.label } : { deny: RATE_LIMITED }))
+  await start($)
+  await submit($, '帮我评审一下改动')
+  await complete($, 'claude-opus-5-5')
+  // 上下文骤减算压缩后的冷点；小模型被限流，规则判为编码（Sonnet），保持 Opus
+  ctx = 100
+  await submit($, '实现登录功能')
+  await complete($, 'claude-opus-5-5')
+  const rows = logRows(h)
+  expect(rows[1]).toMatchObject({ cold: 'compact', via: 'rule', cat: '编码', pick: 'opus' })
+})
+
+test('长对话隔太久回来：提示一次缓存已过期、这轮要整段重写，建议开新会话或压缩', async ($, on) => {
+  const toasts: string[] = []
+  let skew = 0
+  harness(on, { cfg: DEFAULT_CONFIG, ctx: 150_000, toasts, now: () => Date.now() + skew })
+  on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[3]?.label }))
+  await start($)
+  await submit($, '实现登录功能')
+  await complete($, 'claude-sonnet-5-5')
+  await submit($, '再加个注册')
+  expect(toasts.some(t => t.includes('缓存已过期'))).toBe(false)
+  await complete($, 'claude-sonnet-5-5')
+  skew = 2 * 3600_000
+  await submit($, '继续')
+  const hit = toasts.filter(t => t.includes('缓存已过期'))
+  expect(hit.length).toBe(1)
+  expect(hit[0]).toContain('15 万 token')
+  expect(hit[0]).toContain('/compact')
+})
+
+test('配置里还是旧默认提醒点（30 万 / 60 万）的按新默认（20 万 / 40 万）提醒；改过的照旧', async ($, on) => {
+  harness(on, { cfg: { ...DEFAULT_CONFIG, saver: { ...DEFAULT_CONFIG.saver, remindAt: [300_000, 600_000] } }, ctx: 250_000 })
+  on('model.classify', () => ({ value: 'other' }))
+  await start($)
+  const a = await submit($, '继续')
+  expect(a.context?.join(' ') ?? '').toContain('20 万')
+})
+
+test('花费构成：按官方价拆成读、写、输出、新输入，冷点和隔太久的重建单列', () => {
+  const t = (i: number, over: Record<string, unknown>): LogRecord =>
+    ({ t: 'turn', ts: i, arm: 'auto', model: 'claude-sonnet-5-5', in: 1000, cw: 0, cr: 100_000, out: 2000, usd: 0, ctx: 100_000, sid: 's1', cv: '0.4.0-abc', ...over }) as LogRecord
+  const c = costSplit([t(1, { cold: 'start', cw: 50_000, cr: 0 }), t(2, {}), t(3, { cold: 'gap', cw: 100_000, cr: 0 }), t(4, { sub: true })], 0)
+  expect(c.turns).toBe(3)
+  // Sonnet 5.5：读 0.2、写 2×2、输出 10、输入 2（每百万）
+  expect(Math.abs(c.read - 0.02)).toBeLessThan(1e-9)
+  expect(Math.abs(c.write - 0.6)).toBeLessThan(1e-9)
+  expect(Math.abs(c.gapWrite - 0.4)).toBeLessThan(1e-9)
+  expect(c.coldWrite).toBe(c.write)
+  const text = costSplitText(c)
+  expect(text).toContain('写缓存')
+  expect(text).toContain('隔太久')
+  expect(text).not.toContain('记了冷点的')
+  expect(costSplitText(costSplit([], 0))).toBe('')
+  // 0.4.0 之前的日志没记冷点：冷点占比只在记了的轮里算，并写明是几轮
+  const mixed = costSplit([t(0, { cv: undefined, cw: 500_000, cr: 0 }), t(1, { cold: 'gap', cw: 100_000, cr: 0 }), t(2, { cw: 100_000, cr: 0 })], 0)
+  expect(mixed.coldTurns).toBe(2)
+  expect(costSplitText(mixed)).toContain('0.4.0 起记了冷点的 2 轮里，写缓存 50% 是冷点整段重建')
+  expect(costSplitText(costSplit([t(0, { cv: '0.3.1-x', cw: 500_000 })], 0))).not.toContain('冷点')
 })

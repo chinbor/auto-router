@@ -1,11 +1,11 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
-import type { ModelMode, RouterDecision } from '../types'
-import { chainFor, configPath, loadConfig, parseModelList, parseOpencodeModels, saveConfig, tagged, validate } from './config'
+import type { ModelMode, ProbeResult, RouterDecision } from '../types'
+import { chainFor, channelOf, configPath, loadConfig, ocModelArg, parseModelList, parseOpencodeModels, saveConfig, tagged, validate } from './config'
 import type { Config } from './config'
 import { crossedLevel, quotaText, remindText } from './saver'
-import { parseLog, sessionArms } from './stats'
+import { configVersion, parseLog, sessionArms } from './stats'
 import type { Arm, LogRecord, SessionTags } from './stats'
 
 // register.tsx 和 panel.tsx 共用的运行时：配置读写、会话分组、日志、pi 工具注册。
@@ -119,24 +119,92 @@ export async function editConfig($: EngineInterface, fn: (cfg: Config) => Config
 export const sep = () => (rt.isWindows ? '\\' : '/')
 let logFile: string | undefined
 let logLines: string[] = []
+/** 一个日志文件最多这么多行，满了换 日期_会话id-2.jsonl、-3……：$.fs 没有追加，每条都要整份重写，文件不能太大 */
+export const LOG_SEGMENT = 400
+let logSeg = 1
+let logBase = ''
 let logChain: Promise<void> = Promise.resolve()
 
-export async function logDir($: EngineInterface): Promise<string> {
-  return (await configPath($, rt.isWindows)).replace(/auto-router\.json$/, `auto-router${sep()}log`)
+/** 日志和报告的根目录：配置里 dataDir 没设就是 ~/.claude/auto-router */
+export async function dataRoot($: EngineInterface, cfg?: Config): Promise<string> {
+  const dir = (cfg ?? (await config($))).dataDir.trim().replace(/[\\/]+$/, '')
+  return dir || (await configPath($, rt.isWindows)).replace(/\.json$/, '')
 }
 
-/** 记一行；按会话一个文件整份重写，写入串行，插件重载后接着原文件写 */
+export async function logDir($: EngineInterface): Promise<string> {
+  return `${await dataRoot($)}${sep()}log`
+}
+
+export async function reportDir($: EngineInterface): Promise<string> {
+  return `${await dataRoot($)}${sep()}report`
+}
+
+let pluginVersion: Promise<string> | undefined
+
+/** 当前配置版本，写进每条日志；报告按它分组 */
+export async function currentVersion($: EngineInterface, cfg?: Config): Promise<string> {
+  pluginVersion ??= $.fs
+    .read(`${$.plugin.root}${sep()}.claude-plugin${sep()}plugin.json`)
+    .then(t => String((JSON.parse(t) as { version?: string }).version ?? '?'))
+    .catch(() => '?')
+  return configVersion(cfg ?? (await config($)), await pluginVersion)
+}
+
+/**
+ * dataDir 改过后，把默认目录（~/.claude/auto-router/log）里的日志搬过去：同名文件按行合并去重，
+ * 读回核对每一行都在了才删旧文件。每次会话开始都跑一遍，还开着的旧版本会话后来又写的也会搬过去。返回搬了几个文件
+ */
+export async function moveLogs($: EngineInterface): Promise<number> {
+  const from = (await configPath($, rt.isWindows)).replace(/\.json$/, `${sep()}log`)
+  const to = await logDir($)
+  const norm = (p: string) => p.replace(/[\\/]+/g, '/').toLowerCase()
+  if (norm(from) === norm(to) || !(await $.fs.exists(from))) return 0
+  let moved = 0
+  for (const f of await $.fs.list(from)) {
+    if (f.kind !== 'file' || !f.name.endsWith('.jsonl')) continue
+    const src = `${from}${sep()}${f.name}`
+    const dest = `${to}${sep()}${f.name}`
+    const lines = (await $.fs.read(src)).split('\n').filter(Boolean)
+    const have = (await $.fs.exists(dest)) ? (await $.fs.read(dest)).split('\n').filter(Boolean) : []
+    const seen = new Set(have)
+    const merged = [...have, ...lines.filter(l => !seen.has(l))]
+    const ts = (l: string) => Number(/"ts":(\d+)/.exec(l)?.[1] ?? 0)
+    await $.fs.write(dest, merged.sort((a, b) => ts(a) - ts(b)).join('\n') + '\n')
+    const back = new Set((await $.fs.read(dest)).split('\n'))
+    if (!lines.every(l => back.has(l))) continue
+    const rm = rt.isWindows ? ['cmd', '/d', '/c', 'del', '/f', '/q', src] : ['rm', '-f', src]
+    if ((await $.process.run(rm)).exitCode === 0) moved++
+  }
+  return moved
+}
+
+const segmentFile = (base: string, n: number) => `${base}${n > 1 ? `-${n}` : ''}.jsonl`
+/** 文件名里的段号：没带 -n 的是第 1 段 */
+export const segmentOf = (name: string) => Number(/-(\d+)\.jsonl$/.exec(name)?.[1] ?? 1)
+
+/** 记一行；按会话分段整份重写（每段最多 LOG_SEGMENT 行），写入串行，插件重载后接着最后一段写 */
 export function logRecord($: EngineInterface, r: LogRecord): Promise<void> {
   logChain = logChain
     .then(async () => {
       if (!logFile) {
         const id = (await $.session.id()).slice(0, 8)
         const day = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10)
-        logFile = `${await logDir($)}${sep()}${day}_${id}.jsonl`
+        const dir = await logDir($)
+        logBase = `${dir}${sep()}${day}_${id}`
+        // 插件重载后接着最后一段写
+        const names = (await $.fs.exists(dir)) ? (await $.fs.list(dir)).map(f => f.name) : []
+        const segs = names.flatMap(n => (n.startsWith(`${day}_${id}`) ? [segmentOf(n)] : []))
+        logSeg = Math.max(1, ...segs)
+        logFile = segmentFile(logBase, logSeg)
         if (await $.fs.exists(logFile)) logLines = (await $.fs.read(logFile)).split('\n').filter(Boolean)
       }
+      if (logLines.length >= LOG_SEGMENT) {
+        logFile = segmentFile(logBase, ++logSeg)
+        logLines = []
+      }
       const { late: _late, ...tags } = (await sessionTags($)) as SessionTags & { late?: boolean }
-      logLines.push(JSON.stringify({ ...r, ...tags }))
+      // 版本每条现算：会话中途改了配置，后面的记录就带新版本，报告据此把这个会话算作跨版本
+      logLines.push(JSON.stringify({ ...r, ...tags, cv: await currentVersion($) }))
       await $.fs.write(logFile, logLines.join('\n') + '\n')
     })
     .catch(() => undefined)
@@ -148,9 +216,9 @@ export async function readLogs($: EngineInterface, from: number): Promise<LogRec
   if (!(await $.fs.exists(dir))) return []
   const files = (await $.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl') && f.mtimeMs >= from)
   const texts = await Promise.all(files.map(f => $.fs.read(`${dir}${sep()}${f.name}`).catch(() => '')))
-  // 文件名是 日期_会话id前8位.jsonl，旧记录没写 sid 的按文件名补
+  // 文件名是 日期_会话id前8位.jsonl（分段的带 -2、-3），旧记录没写 sid 的按文件名补
   return texts.flatMap((t, i) => {
-    const sid = /_([^_]+)\.jsonl$/.exec(files[i]?.name ?? '')?.[1]
+    const sid = /_([^_]+?)(?:-\d+)?\.jsonl$/.exec(files[i]?.name ?? '')?.[1]
     return parseLog(t).map(r => (r.sid || !sid ? r : { ...r, sid }))
   })
 }
@@ -282,8 +350,9 @@ async function opencodeMajor($: EngineInterface): Promise<number> {
  */
 export async function opencodeArgv($: EngineInterface, model: string, readOnly: boolean, dir: string): Promise<string[]> {
   const agent = readOnly ? OC_READONLY_AGENT : OC_WRITE_AGENT
-  if ((await opencodeMajor($)) < 2) return opencodeCommand($, ['run', '-m', model, '--format', 'json', '--dir', dir, '--agent', agent])
-  return opencodeCommand($, ['run', '-m', model, '--format', 'json', '--agent', agent, '--standalone'])
+  const m = ocModelArg(model)
+  if ((await opencodeMajor($)) < 2) return opencodeCommand($, ['run', '-m', m, '--format', 'json', '--dir', dir, '--agent', agent])
+  return opencodeCommand($, ['run', '-m', m, '--format', 'json', '--agent', agent, '--standalone'])
 }
 
 /** 隔离用的 opencode 配置目录：不读用户全局的 opencode.json（里面的 MCP、插件、全局 AGENTS.md） */
@@ -375,10 +444,33 @@ export function parseOpencodeRun(stdout: string): { text: string; error?: string
   return freeLimit || retryAfterMs ? { text, error, freeLimit, retryAfterMs } : { text, error }
 }
 
+/**
+ * 面板“测一下”：给模型派一句“回复 OK”的只读任务，看此刻能不能用。
+ * 不进任务列表、不写日志（免得把检测算进效果统计），失败时带上报错原文和 opencode 报的恢复时间
+ */
+export async function probeModel($: EngineInterface, cfg: Config, model: string): Promise<ProbeResult> {
+  const t0 = Date.now()
+  const home = await opencodeHome($)
+  const isOc = channelOf(model) === 'opencode'
+  try {
+    const argv = isOc ? await opencodeArgv($, model, true, home) : await piArgv($, model, true, cfg.pi.keepExtensions)
+    const env = { ...(await userEnv($)), ...(isOc ? opencodeEnv(home) : {}) }
+    const run = await $.process.run(argv, { cwd: home, env, stdin: 'Reply with the single word OK.', timeoutMs: 90_000 })
+    const parsed: ReturnType<typeof parseOpencodeRun> = isOc ? parseOpencodeRun(run.stdout) : { text: run.stdout.trim() }
+    const done = { ms: Date.now() - t0, at: Date.now() }
+    if (run.exitCode === 0 && parsed.text && !parsed.error) return { ok: true, ...done }
+    const why = parsed.error ?? run.stderr.trim().split('\n').find(l => l.trim()) ?? `退出码 ${run.exitCode}`
+    return { ok: false, ...done, why: why.slice(0, 120), ...(parsed.retryAfterMs ? { retryAfterMs: parsed.retryAfterMs } : {}) }
+  } catch (err) {
+    const why = /still running/.test(String(err)) ? '90 秒没回应' : String(err).slice(0, 120)
+    return { ok: false, ms: Date.now() - t0, at: Date.now(), why }
+  }
+}
+
 /** opencode 里此刻还在的免费模型；空列表表示没取到（没装 opencode 或命令失败），这时不按下架处理 */
 export async function refreshOpencodeModels($: EngineInterface): Promise<string[]> {
-  // 2.x 的 models 不再接提供商参数（给了只打印帮助），列全部再筛 opencode/ 开头的
-  const args = (await opencodeMajor($)) < 2 ? ['models', 'opencode'] : ['models', '--standalone']
+  // 列出全部提供商：opencode 自己的免费模型，加上你在 opencode 里配的其他家
+  const args = (await opencodeMajor($)) < 2 ? ['models'] : ['models', '--standalone']
   const run = await $.process.run(await opencodeCommand($, args), { env: { ...(await userEnv($)), ...opencodeEnv(await opencodeHome($)) }, timeoutMs: 120_000 }).catch(() => undefined)
   const list = run && run.exitCode === 0 ? parseOpencodeModels(run.stdout) : []
   if (list.length) await update($, ocModels, () => list)
@@ -467,6 +559,7 @@ export function resetSession(cwd: string) {
   toolDescription = ''
   logFile = undefined
   logLines = []
+  logSeg = 1
   tagsCache = undefined
   reminded.clear()
   quotaWarned = false

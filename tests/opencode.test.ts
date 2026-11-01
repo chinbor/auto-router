@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { buildRoles, channelOf, DEFAULT_CONFIG, liveChain, migrateOpencode, privacyBlock, tagged } from '../hooks/config'
+import { buildRoles, channelOf, DEFAULT_CONFIG, liveChain, migrateOpencode, ocModelArg, parseOpencodeModels, privacyBlock, tagged } from '../hooks/config'
 import { describeTool, parseOpencodeRun, parseShim } from '../hooks/core'
 import { channelOfRecord, summarize } from '../hooks/stats'
 import { piStatus } from '../hooks/statusline'
@@ -287,6 +287,41 @@ test('免费额度用完：只停这个模型（按报的恢复时间），同�
   expect(Date.now() - t0).toBeLessThan(46_262_000)
 })
 
+test('面板“测一下”：每个模型发一句，标出能不能用；额度用完的按报的时间暂停；不进任务列表', async ($, on) => {
+  const cfg = ocConfig({ text: { description: 't', models: [GLM, OC_DS, AG3], readOnly: true } })
+  const { calls } = host(on, cfg, {
+    oc: m => (m === GLM ? { exitCode: 1, stdout: FREE_LIMIT, stderr: '' } : { exitCode: 0, stdout: events('OK'), stderr: '' }),
+    pi: () => ({ exitCode: 1, stdout: '', stderr: 'Error: 401 invalid api key' }),
+  })
+  await start($)
+  const ui = await $.ui.mount({
+    plugin: 'auto-router',
+    component: 'Pane',
+    requestId: 'auto-router',
+    surface: 'mobile',
+    props: { title: 'auto-router', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 80 }, view: {} },
+  } as never)
+  await ui.press({ key: 'tab-pi' })
+  await ui.press({ key: 'probe' })
+  let done
+  for (let i = 0; i < 80 && !done; i++) done = await ui.find({ type: 'Text', text: /测过/ })
+  expect(done).toBeDefined()
+  // 切到外派页时会顺带列一次 pi 的模型（没有 stdin），不算检测
+  const probes = calls.filter(c => c.stdin !== undefined)
+  expect(probes.map(modelOf).sort()).toEqual([AG3, OC_DS, GLM].sort())
+  expect(probes.every(c => c.stdin === 'Reply with the single word OK.')).toBe(true)
+  // 额度用完的按报的时间暂停，链里只标 ⏸，恢复时间在顶部合成一条；测不通的标 ✗ 和报错；测通的标 ✓
+  expect(await ui.find({ type: 'Text', text: /[\d-]+ \d+:\d+ 恢复 {2}glm-5\.3-flash-free/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^⏸$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /✗ Error: 401/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^✓$/ })).toBeDefined()
+  await ui.press({ key: 'tab-jobs' })
+  let empty
+  for (let i = 0; i < 20 && !empty; i++) empty = await ui.find({ type: 'Text', text: /还没有任务/ })
+  expect(empty).toBeDefined()
+  await ui.unmount()
+})
+
 test('角色链运行时都失败了：接着试兜底，兜底里被挡下的这时才记', async ($, on) => {
   const cfg = ocConfig({ text: { description: 't', models: [GLM], readOnly: true } }, {}, [MIMO, AG3])
   const { calls } = host(on, cfg, { oc: () => ({ exitCode: 1, stdout: '', stderr: 'Unexpected server error' }) })
@@ -533,14 +568,26 @@ test('外派模型页：标签改名，模型旁标通道，opencode 一组带�
   let hit
   for (let i = 0; i < 30 && !hit; i++) hit = await ui.find({ type: 'Text', text: /OpenCode 免费模型/ })
   expect(hit).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^\[opencode\]$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^\[pi\]$/ })).toBeDefined()
+  // 按通道分组：pi 一组、opencode 一组
+  expect(await ui.find({ type: 'Text', text: /pi 通道/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /opencode 通道/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'bill-opencode-free' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /默认不用/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /提供方会保存内容/ })).toBeDefined()
   writes.length = 0
-  await ui.press({ key: 'allow-here' })
+  await ui.press({ key: 'privacy-here' })
   const last = () => writes.filter(w => w.path.endsWith('auto-router.json')).pop()
   for (let i = 0; i < 50 && !last(); i++) await ui.findAll({})
   expect((JSON.parse(last()?.text ?? '{}') as Config).opencode.allowDirs).toEqual(['D:\\work'])
   await ui.unmount()
+})
+
+test('opencode 里配的其他提供商：记成 oc:提供商/模型，走 opencode，派活时去掉前缀；隐私开关只管免费模型', () => {
+  const list = parseOpencodeModels(['opencode/glm-5.3-flash-free', 'alibaba/qwen3-max', 'zai/glm-5', 'not a model'].join('\n'))
+  expect(list).toEqual(['opencode/glm-5.3-flash-free', 'oc:alibaba/qwen3-max', 'oc:zai/glm-5'])
+  expect(channelOf('oc:alibaba/qwen3-max')).toBe('opencode')
+  expect(ocModelArg('oc:alibaba/qwen3-max')).toBe('alibaba/qwen3-max')
+  expect(ocModelArg('opencode/glm-5.3-flash-free')).toBe('opencode/glm-5.3-flash-free')
+  expect(channelOfRecord({ model: 'oc:zai/glm-5' })).toBe('opencode')
+  const cfg = { ...DEFAULT_CONFIG, opencode: { ...DEFAULT_CONFIG.opencode, allowDirs: [], logged: ['oc:zai/glm-5'] } }
+  expect(privacyBlock(cfg, 'oc:zai/glm-5', 'longctx', 'D:\work', true)).toBeUndefined()
 })

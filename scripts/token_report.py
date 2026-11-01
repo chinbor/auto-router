@@ -27,7 +27,8 @@ import statistics
 import struct
 import sys
 
-PROJECTS = os.path.expanduser("~/.claude/projects")
+# Claude Code 的会话记录；设了 CLAUDE_CONFIG_DIR 时在它下面，也可以用 --projects 指定
+PROJECTS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects")
 CTX_AT = (10, 30, 60)  # 同轮次对比取主会话第几次调用
 
 
@@ -488,12 +489,16 @@ def main():
     ap.add_argument("--save", help="把汇总数字存成 JSON")
     ap.add_argument("--compare", help="和之前 --save 的 JSON 对比")
     ap.add_argument("--split", action="store_true", help="每个会话分开列出主会话和子代理的输入 / 输出")
+    ap.add_argument("--projects", help="会话记录目录，默认 $CLAUDE_CONFIG_DIR/projects 或 ~/.claude/projects")
     ap.add_argument("--until", help="窗口截止时刻（本地时间，如 2026-10-20T13:19），默认现在")
     ap.add_argument("--first-turn-breakdown", action="store_true",
                     help="拆分第一轮输入：系统提示、各组工具定义、技能清单、MCP 说明、CLAUDE.md 等各占多少")
     ap.add_argument("--context-composition", type=int, nargs="?", const=3, metavar="N",
                     help="列出上下文最大的 N 个会话（默认 3）在峰值时，上下文由哪些内容组成")
     a = ap.parse_args()
+    if a.projects:
+        global PROJECTS
+        PROJECTS = a.projects
 
     until = dt.datetime.fromisoformat(a.until).astimezone(dt.timezone.utc) if a.until else None
     sessions, tools = collect(a.days, a.session, until)

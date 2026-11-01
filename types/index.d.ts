@@ -24,6 +24,28 @@ export type PiJob = {
   changes?: string
 }
 
+/** 面板“测一下”对一个模型的结果；running 表示还在测 */
+export type ProbeResult = {
+  ok: boolean
+  /** 用了多久 */
+  ms: number
+  /** 什么时候测的 */
+  at: number
+  /** 失败原因（报错原文前 120 字） */
+  why?: string
+  /** opencode 免费额度用完时报的恢复等待时长 */
+  retryAfterMs?: number
+  running?: boolean
+}
+
+/** 面板“刷新模型列表”的结果：什么时候刷的，比上次多了、少了哪些 */
+export type ModelRefresh = {
+  at: number
+  added: string[]
+  removed: string[]
+  running?: boolean
+}
+
 export type SettingsTab = 'claude' | 'pi' | 'stats' | 'jobs'
 
 /** Claude 模型模式：auto 按问题分类，off 不动，其余为固定别名 */
@@ -44,7 +66,7 @@ export type RouterDecision = {
   fix?: boolean
   /** 质量防护改了结果时的说明，如“上下文长，不降档” */
   why?: string
-  /** 对照日：只分类不切换，model 是本来会选的 */
+  /** 对照组：只分类不切换，model 是本来会选的 */
   control?: boolean
   /** 分类没得到类别的原因 */
   cf?: ClassifyFailure
@@ -52,11 +74,20 @@ export type RouterDecision = {
   cerr?: string
   /** 分类耗时（毫秒） */
   cms?: number
-  /** 用哪条路分出来的：classify 小模型，fork 沿用主对话请求 */
-  via?: 'classify' | 'fork'
+  /** 用哪条路分出来的：classify 小模型，rule 本地规则，fork 沿用主对话请求 */
+  via?: 'classify' | 'rule' | 'fork'
   /** fork 的 token 用量：输入、缓存读、缓存写、输出 */
   fu?: [number, number, number, number]
+  /** 这一轮是冷点（缓存本来就要重建）：start 会话第一条，gap 隔太久缓存已过期，compact 上下文刚被压缩 */
+  cold?: ColdReason
+  /** 本地规则判的类别中文名（冷点上小模型分类成功时也记，用来算规则和模型的一致率） */
+  rc?: string
 }
+
+export type ColdReason = 'start' | 'gap' | 'compact'
+
+/** 判断冷点用：上一轮主对话的时间和上下文大小，上下文被压缩过 */
+export type ColdMark = { ts?: number; ctx?: number; compacted?: boolean }
 
 /** timeout 超时；error 请求出错；none 模型的回答不在类别里 */
 /** skip：上下文长、已在最高档，分类结果改变不了模型，没去 fork */
@@ -70,6 +101,7 @@ declare module 'claude-code' {
       /** pi 外派建议开关 */
       piAuto: boolean
       last: Shaped<RouterDecision | null>
+      cold: Shaped<ColdMark>
       /** 设置面板当前的标签页 */
       tab: SettingsTab
       /** Claude 模型页展开了“更多设置” */
@@ -88,6 +120,10 @@ declare module 'claude-code' {
       rebuildAsk: boolean
       /** 外派模型页展开高级设置 */
       advOpen: boolean
+      /** 面板最近一次“刷新模型列表” */
+      refresh: Shaped<ModelRefresh | null>
+      /** 面板“测一下”的结果，键是完整模型名 */
+      probe: Shaped<Record<string, ProbeResult>>
       /** 效果页统计最近几天 */
       statsDays: number
     }

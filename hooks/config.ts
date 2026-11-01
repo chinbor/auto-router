@@ -9,8 +9,8 @@ export type Category = {
   label: string
   /** 状态栏显示的中文名 */
   name: string
-  /** Claude 模型别名；不写则保持会话原模型 */
-  model?: 'haiku' | 'sonnet' | 'opus'
+  /** Claude 模型：别名（haiku / sonnet / opus / fable，跟最新版）或完整 id（如 claude-opus-4-8）；不写则保持会话原模型 */
+  model?: string
   /** 建议外派的 pi 角色 */
   piRole?: string
 }
@@ -55,12 +55,29 @@ export type Tier = 'strong' | 'mid' | 'light'
 
 export type Config = {
   claude: {
-    /** 降档要连续多少轮都判为更轻的类别；升档立即生效 */
+    /**
+     * 什么时候分类、换模型。cold：只在冷点（会话第一条、隔太久缓存已过期、上下文刚被压缩），这时缓存反正要重建，
+     * 换模型不多花钱；冷点之间不分类、不降档，只在被纠正或规则判出重活时升档。turn：每轮都分类，旧做法，留作对照
+     */
+    switchAt: 'cold' | 'turn'
+    /** 距上一轮多少分钟算缓存已过期（订阅登录是 1 小时缓存；用 API key、5 分钟缓存的改成 5） */
+    coldGapMinutes: number
+    /**
+     * 主对话最低用到哪一档，类别选了更轻的也按这档。默认 sonnet：实测闲聊轮总共只占花费的 1%，
+     * 换到 Haiku 省下的很少，却要多一次缓存重写，还有质量风险
+     */
+    floor: 'haiku' | 'sonnet'
+    /** turn 模式：降档要连续多少轮都判为更轻的类别；升档立即生效 */
     downgradeAfter: number
-    /** 上下文超过这么多 token 时不降档（换模型要整段重写缓存，越长越亏）；0 表示不限 */
+    /** turn 模式：上下文超过这么多 token 时不降档（换模型要整段重写缓存，越长越亏）；0 表示不限 */
     keepAboveTokens: number
     /** 用户在纠正上一轮（不对、重做…）时升一档 */
     upgradeOnCorrection: boolean
+    /**
+     * 小模型分类被限流或超时时，改让主对话的模型 fork 一次来分类。fork 要按缓存读价把整段上下文读一遍，
+     * 实测长对话里这笔钱比换小模型省下的还多，默认关：分不出来就保持当前模型
+     */
+    forkFallback: boolean
     categories: Category[]
   }
   pi: {
@@ -110,6 +127,8 @@ export type Config = {
   }
   /** 对照实验：每个新会话按会话 id 固定分组。route 只测模型切换，saver 只测省额度，both 两个一起（2×2） */
   experiment: Experiment
+  /** 日志（log/）和效果报告（report/）放哪；空字符串是 ~/.claude/auto-router。放到别的盘可以躲开清理 ~/.claude 的工具 */
+  dataDir: string
 }
 
 export type Experiment = 'off' | 'route' | 'saver' | 'both'
@@ -134,9 +153,13 @@ const OC_PICKLE = 'opencode/big-pickle'
 // 强度 gpt > deepseek ≈ 免费的中档 > agnes；terra 比 sol 快、便宜，看图和操作电脑更强，sol 推理更强。
 export const DEFAULT_CONFIG: Config = {
   claude: {
-    downgradeAfter: 2,
+    switchAt: 'cold',
+    coldGapMinutes: 60,
+    floor: 'sonnet',
+    downgradeAfter: 4,
     keepAboveTokens: 150_000,
     upgradeOnCorrection: true,
+    forkFallback: false,
     categories: [
       { label: 'greeting, small talk or a quick factual question', name: '闲聊/简答', model: 'haiku' },
       { label: 'translating, summarizing, proofreading or rewriting text', name: '文本处理', model: 'sonnet', piRole: 'text' },
@@ -166,7 +189,7 @@ export const DEFAULT_CONFIG: Config = {
           holidays: [],
         },
       },
-      opencode: { enabled: true, billing: 'free', note: '免费模型走 opencode run；随时可能下架，限流时整家暂停' },
+      opencode: { enabled: true, billing: 'free', note: '免费模型走 opencode run；随时可能下架；某个模型免费额度用完只停那一个' },
     },
     roles: {
       review: {
@@ -241,25 +264,26 @@ export const DEFAULT_CONFIG: Config = {
   saver: {
     enabled: true,
     guard: true,
-    remindAt: [300_000, 600_000],
+    remindAt: [200_000, 400_000],
     bigRead: 'auto',
     quotaPct: 70,
   },
   experiment: 'off',
+  dataDir: '',
 }
 
 let pathCache: string | undefined
 
 export async function configPath($: EngineInterface, isWindows: boolean): Promise<string> {
   if (pathCache) return pathCache
-  // 插件装在 ~/.claude 下时直接从路径推；否则问 shell
+  // 插件装在 ~/.claude 下时直接从路径推；否则问 shell：设了 CLAUDE_CONFIG_DIR 用它，没设用 ~/.claude
   const m = /^(.*?[\\/]\.claude)[\\/]/.exec($.plugin.root)
   let dir = m?.[1]
   if (!dir) {
     const run = isWindows
-      ? await $.process.run(['cmd', '/d', '/c', 'echo %USERPROFILE%'])
-      : await $.process.run(['sh', '-c', 'printf %s "$HOME"'])
-    dir = `${run.stdout.trim()}${isWindows ? '\\' : '/'}.claude`
+      ? await $.process.run(['cmd', '/d', '/c', 'if defined CLAUDE_CONFIG_DIR (echo %CLAUDE_CONFIG_DIR%) else (echo %USERPROFILE%\\.claude)'])
+      : await $.process.run(['sh', '-c', 'printf %s "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"'])
+    dir = run.stdout.trim().replace(/[\\/]+$/, '')
   }
   pathCache = `${dir}${isWindows ? '\\' : '/'}auto-router.json`
   return pathCache
@@ -273,6 +297,14 @@ export function consumeCreated(): boolean {
   const was = created
   created = false
   return was
+}
+
+/**
+ * 0.4.0 前的默认提醒点 30 万 / 60 万：日志里 20–40 万 token 的轮次占了六成花费，提醒得太晚。
+ * 文件里还是旧默认值（用户没改过）就按新默认用，改过的照旧
+ */
+function oldRemind(v: unknown): Partial<Config['saver']> {
+  return Array.isArray(v) && v.length === 2 && v[0] === 300_000 && v[1] === 600_000 ? { remindAt: DEFAULT_CONFIG.saver.remindAt } : {}
 }
 
 /** 读配置，缺的字段用默认值补；文件不存在就写一份默认的 */
@@ -292,8 +324,9 @@ export async function loadConfig($: EngineInterface, isWindows: boolean): Promis
       claude: { ...DEFAULT_CONFIG.claude, ...claude },
       pi: { ...DEFAULT_CONFIG.pi, ...raw.pi },
       opencode: { ...DEFAULT_CONFIG.opencode, ...raw.opencode },
-      saver: { ...DEFAULT_CONFIG.saver, ...raw.saver },
+      saver: { ...DEFAULT_CONFIG.saver, ...raw.saver, ...oldRemind(raw.saver?.remindAt) },
       experiment: raw.experiment ?? (legacyAb ? 'route' : DEFAULT_CONFIG.experiment),
+      dataDir: raw.dataDir ?? DEFAULT_CONFIG.dataDir,
     }
     const { cfg, note } = raw.pi && !raw.opencode ? migrateOpencode(merged) : { cfg: merged, note: undefined }
     const errs = validate(cfg)
@@ -356,7 +389,6 @@ export async function saveConfig($: EngineInterface, isWindows: boolean, config:
 
 // ---------- 校验与修改（设置面板和 router_config 工具共用） ----------
 
-const CLAUDE_MODELS = ['haiku', 'sonnet', 'opus']
 const TIERS: string[] = ['strong', 'mid', 'light']
 const BILLINGS: Billing[] = ['free', 'subscription', 'token']
 const HHMM_RANGE = /^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-4]):[0-5]\d$/
@@ -366,15 +398,20 @@ const DATE = /^\d{4}-\d{2}-\d{2}$/
 export function validate(cfg: Config): string[] {
   const errs: string[] = []
   const c = cfg.claude
+  if (c?.switchAt !== 'cold' && c?.switchAt !== 'turn') errs.push('claude.switchAt 只能是 cold / turn')
+  if (!Number.isFinite(c?.coldGapMinutes) || c.coldGapMinutes < 1) errs.push('claude.coldGapMinutes 要是 ≥1 的数字')
+  if (c?.floor !== 'haiku' && c?.floor !== 'sonnet') errs.push('claude.floor 只能是 haiku / sonnet')
   if (!Number.isInteger(c?.downgradeAfter) || c.downgradeAfter < 1) errs.push('claude.downgradeAfter 要是 ≥1 的整数')
   if (!Number.isFinite(c?.keepAboveTokens) || c.keepAboveTokens < 0) errs.push('claude.keepAboveTokens 要是 ≥0 的数字')
   if (typeof c?.upgradeOnCorrection !== 'boolean') errs.push('claude.upgradeOnCorrection 要是 true / false')
+  if (typeof c?.forkFallback !== 'boolean') errs.push('claude.forkFallback 要是 true / false')
   if (!Array.isArray(c?.categories) || c.categories.length === 0) errs.push('claude.categories 不能为空')
   const providers = cfg.pi?.providers ?? {}
   const roles = cfg.pi?.roles ?? {}
   c?.categories?.forEach((cat, i) => {
     if (!cat?.label || !cat.name) errs.push(`claude.categories[${i}] 缺 label 或 name`)
-    if (cat?.model !== undefined && !CLAUDE_MODELS.includes(cat.model)) errs.push(`claude.categories[${i}].model 只能是 ${CLAUDE_MODELS.join(' / ')} 或不写`)
+    if (cat?.model !== undefined && !isClaudeModel(cat.model))
+      errs.push(`claude.categories[${i}].model 只能是 ${CLAUDE_ALIASES.join(' / ')}、claude- 开头的完整模型名，或不写`)
     if (cat?.piRole !== undefined && !roles[cat.piRole]) errs.push(`claude.categories[${i}].piRole「${cat.piRole}」不是已有角色`)
   })
   if (!Number.isFinite(cfg.pi?.timeoutMinutes) || cfg.pi.timeoutMinutes <= 0 || cfg.pi.timeoutMinutes > 10) errs.push('pi.timeoutMinutes 要在 0–10 之间')
@@ -416,6 +453,7 @@ export function validate(cfg: Config): string[] {
   if (!['auto', 'scout', 'pi'].includes(sv?.bigRead)) errs.push('saver.bigRead 只能是 auto / scout / pi')
   if (!Number.isFinite(sv?.quotaPct) || sv.quotaPct < 0 || sv.quotaPct > 100) errs.push('saver.quotaPct 要在 0–100 之间')
   if (!['off', 'route', 'saver', 'both'].includes(cfg.experiment)) errs.push('experiment 只能是 off / route / saver / both')
+  if (typeof cfg.dataDir !== 'string') errs.push('dataDir 要是文件夹路径，空字符串表示 ~/.claude/auto-router')
   for (const [name, r] of Object.entries(roles)) {
     if (!r?.description) errs.push(`pi.roles.${name}.description 不能为空`)
     if (!Array.isArray(r?.models) || r.models.length === 0) errs.push(`pi.roles.${name}.models 至少要有一个模型`)
@@ -457,7 +495,50 @@ export function parseModelList(stdout: string): string[] {
     .map(cols => `${cols[0]}/${cols[1]}`)
 }
 
-const RANK: Record<string, number> = { haiku: 0, sonnet: 1, opus: 2 }
+const FAMILY_RANK: [string, number][] = [
+  ['haiku', 0],
+  ['sonnet', 1],
+  ['opus', 2],
+  ['fable', 3],
+]
+
+/** Claude 模型的档：别名或完整 id 都按系列算（haiku < sonnet < opus < fable）；认不出返回 undefined */
+export function rankOf(model?: string): number | undefined {
+  const m = (model ?? '').toLowerCase()
+  return FAMILY_RANK.find(([k]) => m.includes(k))?.[1]
+}
+
+/** 低于最低档的模型按最低档；认不出的、不写的原样返回 */
+export function atLeast(model: string | undefined, floor: string): string | undefined {
+  const r = rankOf(model)
+  return r !== undefined && r < (rankOf(floor) ?? 0) ? floor : model
+}
+
+/** Claude 别名：随 Claude Code 指向各系列的最新版 */
+export const CLAUDE_ALIASES = ['haiku', 'sonnet', 'opus', 'fable']
+
+/** 分类能选的 Claude 模型：别名，或 claude- 开头的完整 id（如 claude-opus-4-8，固定在这个版本） */
+export function isClaudeModel(m: string): boolean {
+  return CLAUDE_ALIASES.includes(m) || /^claude-[a-z0-9.-]+$/.test(m)
+}
+
+/**
+ * 从 pi --list-models 里挑出 Claude 的具体版本（anthropic/claude-*），去掉带日期的快照；
+ * 按系列从强到弱、同系列版本从新到旧排
+ */
+export function claudeModelsFrom(list: string[]): string[] {
+  const ver = (m: string) => (/-(\d+)-(\d+)$/.exec(m) ?? /-(\d+)$/.exec(m) ?? []).slice(1).map(Number)
+  const ids = list
+    .filter(m => m.startsWith('anthropic/claude-'))
+    .map(m => m.slice('anthropic/'.length))
+    .filter(m => !/-\d{8}$/.test(m) && rankOf(m) !== undefined)
+  return [...new Set(ids)].sort((a, b) => {
+    const r = (rankOf(b) ?? 0) - (rankOf(a) ?? 0)
+    if (r) return r
+    const [x, y] = [ver(a), ver(b)]
+    return (y[0] ?? 0) - (x[0] ?? 0) || (y[1] ?? 0) - (x[1] ?? 0)
+  })
+}
 
 /** 升档立即生效；降档要连续 downgradeAfter 轮都想降才降；分类不给模型时保持不变 */
 export function sticky(
@@ -467,7 +548,7 @@ export function sticky(
 ): { model?: string; lighterStreak: number } {
   const current = prev?.model
   if (!wanted) return { model: current, lighterStreak: 0 }
-  if (!current || (RANK[wanted] ?? 0) >= (RANK[current] ?? 0)) return { model: wanted, lighterStreak: 0 }
+  if (!current || (rankOf(wanted) ?? 0) >= (rankOf(current) ?? 0)) return { model: wanted, lighterStreak: 0 }
   const streak = (prev?.lighterStreak ?? 0) + 1
   return streak >= downgradeAfter ? { model: wanted, lighterStreak: 0 } : { model: current, lighterStreak: streak }
 }
@@ -476,9 +557,20 @@ export function providerOf(model: string): string {
   return model.split('/')[0] ?? model
 }
 
-/** 模型走哪个通道：opencode/ 开头的走 opencode run，其余走 pi */
+/**
+ * opencode 里配的其他提供商（你自己的账号，如 alibaba、zai）在本插件里写成 "oc:alibaba/qwen3-max"，
+ * 和 pi 里同名的提供商分开记付费方式；opencode 自己的免费模型仍是 "opencode/xxx"
+ */
+export const OC_PREFIX = 'oc:'
+
+/** 模型走哪个通道：opencode/ 和 oc: 开头的走 opencode run，其余走 pi */
 export function channelOf(model: string): Channel {
-  return providerOf(model) === 'opencode' ? 'opencode' : 'pi'
+  return providerOf(model) === 'opencode' || model.startsWith(OC_PREFIX) ? 'opencode' : 'pi'
+}
+
+/** 传给 opencode run -m 的模型名：去掉 oc: 前缀 */
+export function ocModelArg(model: string): string {
+  return model.startsWith(OC_PREFIX) ? model.slice(OC_PREFIX.length) : model
 }
 
 /** 带通道标签的模型名，如 "[opencode] opencode/glm-5.3-flash-free" */
@@ -486,12 +578,13 @@ export function tagged(model: string): string {
   return `[${channelOf(model)}] ${model}`
 }
 
-/** 解析 `opencode models` 的输出：一行一个 provider/id，只留 opencode 自己的 */
+/** 解析 `opencode models` 的输出：一行一个 provider/id；opencode 自己的原样，其他提供商加 oc: 前缀 */
 export function parseOpencodeModels(stdout: string): string[] {
   return stdout
     .split(/\r?\n/)
     .map(l => l.trim())
-    .filter(l => /^opencode\/\S+$/.test(l))
+    .filter(l => /^[\w.-]+\/\S+$/.test(l))
+    .map(l => (l.startsWith('opencode/') ? l : `${OC_PREFIX}${l}`))
 }
 
 function normDir(dir: string, isWindows: boolean): string {
@@ -510,7 +603,8 @@ function inside(dir: string, parent: string, isWindows: boolean): boolean {
  * logged 里的模型只在 allowDirs 里的目录用；allowDirs 有值时，长文阅读也只在这些目录里用 opencode。
  */
 export function privacyBlock(cfg: Config, model: string, role: string, cwd: string, isWindows: boolean): string | undefined {
-  if (channelOf(model) !== 'opencode') return undefined
+  // 只管 opencode 自己的免费模型；oc: 开头的是你自己账号下的提供商
+  if (providerOf(model) !== 'opencode') return undefined
   const dirs = cfg.opencode.allowDirs
   const allowed = dirs.includes('*') || dirs.some(d => inside(cwd, d, isWindows))
   if (allowed) return undefined
@@ -565,9 +659,11 @@ export function liveChain(
   now: number,
   isDown: (providerOrModel: string) => boolean = () => false,
   skip: (model: string) => boolean = () => false,
+  demote: Set<string> = new Set(),
 ): { models: string[]; isFallback: boolean } {
   const primary = chainFor(cfg, role, now).filter(m => !isDown(providerOf(m)) && !isDown(m) && !skip(m))
-  if (primary.length) return { models: primary, isFallback: false }
+  // 返工多的模型排到链尾，不删掉：别的都用不了时照样能接
+  if (primary.length) return { models: [...primary.filter(m => !demote.has(m)), ...primary.filter(m => demote.has(m))], isFallback: false }
   return { models: usableFallback(cfg, now, isDown, skip), isFallback: true }
 }
 
@@ -595,8 +691,11 @@ export function earliestRun(config: Config, chain: string[], now: number): numbe
 type BillingPick = 'free' | 'paid' | 'sub'
 
 type RoleTemplate = {
-  /** 依次从哪个档位、哪种计费方式取几个模型；不写计费方式表示都行（同档里仍是 免费 → 订阅 → 按量） */
-  pick: [Tier, number, BillingPick?][]
+  /**
+   * 依次从哪个档位、哪种计费方式取几个模型；不写计费方式表示都行（同档里仍是 免费 → 订阅 → 按量）。
+   * 第四项为 true 时只取链里还没有的提供商：同一家的免费模型常一起额度用完，换一家才顶得上
+   */
+  pick: [Tier, number, BillingPick?, boolean?][]
   /** 这些档位里倒过来取（同档排在后面的更快更便宜） */
   cheaper?: Tier[]
   readOnly?: boolean
@@ -612,7 +711,8 @@ export const ROLE_TEMPLATES: Record<string, RoleTemplate> = {
   longctx: { pick: [['mid', 1, 'free'], ['mid', 1, 'paid'], ['strong', 1]], cheaper: ['strong'], readOnly: true },
   quick: { pick: [['mid', 1, 'free'], ['light', 1, 'paid'], ['strong', 1]], cheaper: ['strong'] },
   text: { pick: [['mid', 1, 'free'], ['light', 2, 'paid']], readOnly: true },
-  trivial: { pick: [['light', 1, 'free'], ['light', 1, 'paid'], ['light', 1, 'free']], cheaper: ['light'], readOnly: true },
+  // 另一家的免费轻档（如讯飞赠送额度）排在订阅前面；没有就照旧 免费 › 订阅 › 免费
+  trivial: { pick: [['light', 1, 'free'], ['light', 1, 'free', true], ['light', 1, 'paid'], ['light', 1, 'free']], cheaper: ['light'], readOnly: true },
 }
 
 const BILLING_RANK: Record<Billing, number> = { free: 0, subscription: 1, token: 2 }
@@ -648,12 +748,12 @@ export function buildRoles(cfg: Config): Config {
   const any = (['strong', 'mid', 'light'] as Tier[]).flatMap(t => tierModels(cfg, t, false))
   for (const [name, tpl] of Object.entries(ROLE_TEMPLATES)) {
     const models: string[] = []
-    const take = (tier: Tier, n: number, billing?: BillingPick) =>
+    const take = (tier: Tier, n: number, billing?: BillingPick, otherProvider?: boolean) =>
       tierModels(cfg, tier, tpl.cheaper?.includes(tier) === true, name, billing)
-        .filter(m => !models.includes(m))
+        .filter(m => !models.includes(m) && !(otherProvider && models.some(x => providerOf(x) === providerOf(m))))
         .slice(0, n)
         .forEach(m => models.push(m))
-    for (const [tier, n, billing] of tpl.pick) take(tier, n, billing)
+    for (const [tier, n, billing, other] of tpl.pick) take(tier, n, billing, other)
     for (const [tier] of tpl.pick) if (models.length < 2) take(tier, 2 - models.length)
     if (models.length === 0 && any[0]) models.push(any[0])
     if (models.length === 0) continue
