@@ -739,6 +739,20 @@ function tierModels(cfg: Config, tier: Tier, cheaper: boolean, role?: string, bi
 }
 
 /**
+ * 第一次运行时按本机检测到的外派通道改默认配置：只开着检测到的提供商（pi 里列得出模型的那几家，装了 opencode 才开 opencode），
+ * 再按档位重排角色。一个能用的角色都排不出来时只关提供商、角色照旧，外派工具就不注册，等用户在「外派模型」页配好
+ */
+export function onlyDetected(cfg: Config, piList: string[], oc: boolean): Config {
+  const have = new Set(piList.map(providerOf))
+  const providers = Object.fromEntries(
+    Object.entries(cfg.pi.providers).map(([p, v]) => [p, { ...v, enabled: p === 'opencode' || p.startsWith('oc:') ? oc : have.has(p) }]),
+  )
+  const next = { ...cfg, pi: { ...cfg.pi, providers } }
+  const built = buildRoles(next)
+  return Object.keys(built.pi.roles).length ? built : next
+}
+
+/**
  * 按档位重建内置角色和兜底；角色原来的说明和只读设置保留，自己加的角色不动。
  * 某档或某种计费方式没有模型就跳过；取到的不到 2 个时，从模板用到的档位里不限计费方式补到 2 个；
  * 一个都取不到时，用任意一个有档位的模型顶上。

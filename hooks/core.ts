@@ -2,7 +2,7 @@ import { atom, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { ModelMode, ProbeResult, RouterDecision } from '../types'
-import { chainFor, channelOf, configPath, loadConfig, ocModelArg, parseModelList, parseOpencodeModels, saveConfig, tagged, validate } from './config'
+import { chainFor, channelOf, configPath, loadConfig, ocModelArg, onlyDetected, parseModelList, parseOpencodeModels, saveConfig, tagged, validate } from './config'
 import type { Config } from './config'
 import { crossedLevel, quotaText, remindText } from './saver'
 import { configVersion, parseLog, sessionArms } from './stats'
@@ -529,10 +529,60 @@ export function describeTool(cfg: Config): string {
   )
 }
 
+/** 本机有没有外派通道，跨会话记在 store 里：会话开始时先按上次的结果定要不要注册外派工具，后台再检测一遍 */
+type Channels = { pi: boolean; oc: boolean; at: number }
+const CHANNELS = 'channels'
+/** 上次检测 pi 和 opencode 都没装 */
+let noChannels = false
+
+export async function initChannels($: EngineInterface): Promise<void> {
+  const known = (await $.store.get(CHANNELS).catch(() => undefined)) as Channels | undefined
+  noChannels = !!known && !known.pi && !known.oc
+}
+
+/**
+ * 后台检测本机的 pi、opencode：两边都列不出模型就算没装，外派工具改成“不可用”（引擎不能撤掉已注册的工具），下个会话起不注册。
+ * 装了的一天查一次；没装的每个会话都查（没装时命令立刻失败，不费事），装上后当场注册。
+ * firstRun（配置文件刚生成）时只开着检测到的提供商，按档位重排角色
+ */
+export async function detectChannels($: EngineInterface, firstRun: boolean): Promise<void> {
+  const known = (await $.store.get(CHANNELS).catch(() => undefined)) as Channels | undefined
+  if (!firstRun && known && (known.pi || known.oc) && Date.now() - known.at < 86_400_000) return
+  const [pi, oc] = await Promise.all([refreshPiModels($), refreshOpencodeModels($)])
+  const found: Channels = { pi: pi.length > 0, oc: oc.length > 0, at: Date.now() }
+  await $.store.set(CHANNELS, found).catch(() => undefined)
+  noChannels = !found.pi && !found.oc
+  if (firstRun && !noChannels) {
+    const errs = await editConfig($, cfg => onlyDetected(cfg, pi, found.oc))
+    if (!errs.length) return
+  }
+  await registerTools($, await config($))
+}
+
+/** 外派工具此刻能不能用：装了 pi 或 opencode，且至少一个角色排得出模型 */
+export function canDelegate(cfg: Config): boolean {
+  return !noChannels && Object.keys(cfg.pi.roles).some(r => chainFor(cfg, r).length > 0)
+}
+
+const NO_DELEGATE =
+  'Not available: neither the pi coding agent nor opencode is installed on this machine, or no delegate model is set up. Do not call this tool; do the work yourself. ' +
+  'The user can install pi or opencode and pick models in /auto-router (the delegate models tab).'
+
 export async function registerTools($: EngineInterface, cfg: Config): Promise<void> {
-  const description = describeTool(cfg)
+  const usable = canDelegate(cfg)
+  // 本会话还没注册过、又用不了：不注册，模型看不到它，系统提示里的规则也就不提外派
+  if (!usable && !toolDescription) return
+  const description = usable ? describeTool(cfg) : NO_DELEGATE
   if (description === toolDescription) return
+  const first = !toolDescription
   toolDescription = description
+  if (first)
+    await $.tool.register({
+      name: 'pi_result',
+      isDeferred: false,
+      description: 'Get the status and output of a job (pi or opencode) started by pi_dispatch with background=true, or one queued for off-peak hours.',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    })
   await $.tool.register({
     name: 'pi_dispatch',
     isDeferred: false,

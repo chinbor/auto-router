@@ -4,7 +4,7 @@ import type { EngineInterface } from 'claude-code'
 import type { Config } from './config'
 import { configPath, validate } from './config'
 import { config, currentVersion, dataRoot, logDir, readLogs, reportDir, rt, sep } from './core'
-import { categoryStats, categoryText, costSplit, costSplitText, experimentReport, redoStats, redoText, reportText, summarize } from './stats'
+import { categoryStats, categoryText, costSplit, costSplitText, delegateStats, delegateText, experimentReport, redoStats, redoText, reportText, summarize } from './stats'
 
 const piModels = atom({ plugin: 'auto-router', key: 'piModels' } as const, [], { shape: 'models-1' })
 const ocModels = atom({ plugin: 'auto-router', key: 'ocModels' } as const, [], { shape: 'models-1' })
@@ -40,11 +40,13 @@ async function effectData($: EngineInterface, days: number) {
     weekQuotaPct: s.week,
     // 主对话花费按读缓存、写缓存、新输入、输出拆开（官方价）；冷点重建、缓存过期重建单独算
     costSplit: costSplit(logs, from),
+    // 外派提示了几轮、当轮真派了几轮（0.4.0 起记）
+    delegate: delegateStats(logs, from),
     guards: logs.filter(r => r.t === 'guard' && !r.again).length,
     guardsReleased: logs.filter(r => r.t === 'guard' && r.again).length,
   }
   const { sessions: _s, ...experiment } = exp
-  const extra = [costSplitText(overall.costSplit), redoText(overall.piRedo)].filter(Boolean)
+  const extra = [costSplitText(overall.costSplit), delegateText(overall.delegate), redoText(overall.piRedo)].filter(Boolean)
   return { overall, experiment, categories: categoryStats(logs, from), text: [reportText(exp, days), ...extra].join('\n\n') }
 }
 

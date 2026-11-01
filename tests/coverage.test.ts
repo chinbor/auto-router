@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { DEFAULT_CONFIG, liveChain } from '../hooks/config'
+import { chainFor, DEFAULT_CONFIG, liveChain, onlyDetected } from '../hooks/config'
 import type { Config } from '../hooks/config'
 import { coldReason, pickByNumber } from '../hooks/classify'
 import { ruleLabel } from '../hooks/rules'
 import { imageDims } from '../hooks/saver'
-import { categoryStats, categoryText, cellStats, costSplit, costSplitText, summarize, configVersion, demotedModels, modelVersions, overlap, redoStats, redoText, sessionArms, sessionStats, taskWords, versionLabel } from '../hooks/stats'
+import { categoryStats, categoryText, cellStats, costSplit, costSplitText, delegateStats, delegateText, summarize, configVersion, demotedModels, modelVersions, overlap, redoStats, redoText, sessionArms, sessionStats, taskWords, versionLabel } from '../hooks/stats'
 import type { LogRecord } from '../hooks/stats'
 
 type On = Parameters<TestBody>[1]
@@ -28,7 +28,7 @@ type Harness = { files: Record<string, string>; sizes: Record<string, number>; b
  * 引擎替身：files 是磁盘（配置、日志都在里面，写入也落在这里），sizes 给 fs.stat 用，bytes 给按字节读用。
  * 配置文件按 cfg 预置；目录列表从 files 里推出来。
  */
-function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: string; ctx?: number | (() => number); wk?: number; toasts?: string[]; now?: () => number } = {}): Harness {
+function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: string; ctx?: number | (() => number); wk?: number; toasts?: string[]; now?: () => number; tools?: string[] } = {}): Harness {
   const h: Harness = { files: {}, sizes: {}, bytes: {} }
   if (opts.cfg) h.files.CFG = JSON.stringify(opts.cfg)
   // 配置文件和日志目录的真实位置从插件目录推出来，这里统一换成 CFG、LOG 两个键
@@ -39,7 +39,10 @@ function harness(on: On, opts: { cfg?: Config | Record<string, unknown>; sid?: s
     return abs.replace(/\//g, '\\').replace(/^.*\\auto-router\\log(?=\\|$)/, 'LOG')
   }
   on('command.register', (_, e) => ({ value: { command: e.name } }))
-  on('tool.register', (_, e) => ({ value: { tool: `mcp__auto-router__${e.name}` } }))
+  on('tool.register', (_, e) => {
+    opts.tools?.push(e.name)
+    return { value: { tool: `mcp__auto-router__${e.name}` } }
+  })
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.toast', (_, e) => {
     opts.toasts?.push(e.text)
@@ -851,4 +854,73 @@ test('花费构成：按官方价拆成读、写、输出、新输入，冷点�
   expect(mixed.coldTurns).toBe(2)
   expect(costSplitText(mixed)).toContain('0.4.0 起记了冷点的 2 轮里，写缓存 50% 是冷点整段重建')
   expect(costSplitText(costSplit([t(0, { cv: '0.3.1-x', cw: 500_000 })], 0))).not.toContain('冷点')
+})
+
+async function toolsWith(on: On, $: Parameters<TestBody>[0], known: { pi: boolean; oc: boolean }): Promise<string[]> {
+  const tools: string[] = []
+  harness(on, { cfg: DEFAULT_CONFIG, tools })
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'channels' ? { ...known, at: 1 } : undefined }))
+  await start($)
+  return tools
+}
+
+test('上次检测 pi 和 opencode 都没装：不注册外派工具，系统提示里也就不提外派', async ($, on) => {
+  const tools = await toolsWith(on, $, { pi: false, oc: false })
+  expect(tools).not.toContain('pi_dispatch')
+  expect(tools).not.toContain('pi_result')
+  expect(tools).toContain('router_config')
+})
+
+test('装了 pi：照常注册外派工具', async ($, on) => {
+  const tools = await toolsWith(on, $, { pi: true, oc: false })
+  expect(tools).toContain('pi_dispatch')
+  expect(tools).toContain('pi_result')
+})
+
+test('第一次运行按检测结果改默认配置：只开检测到的提供商并重排角色；一个都排不出时只关提供商', () => {
+  const cfg = DEFAULT_CONFIG
+  // 只装了 opencode
+  const oc = onlyDetected(cfg, [], true)
+  expect(oc.pi.providers.openai?.enabled).toBe(false)
+  expect(oc.pi.providers.opencode?.enabled).toBe(true)
+  const chains = Object.keys(oc.pi.roles).flatMap(r => chainFor(oc, r))
+  expect(chains.length).toBeGreaterThan(0)
+  expect(chains.every(m => m.startsWith('opencode/'))).toBe(true)
+  // pi 里只有 openai 有 key
+  const gpt = onlyDetected(cfg, ['openai/gpt-6.1-sol', 'openai/gpt-6.1-terra'], false)
+  expect(gpt.pi.providers.openai?.enabled).toBe(true)
+  expect(gpt.pi.providers.agnes?.enabled).toBe(false)
+  expect(Object.keys(gpt.pi.roles).flatMap(r => chainFor(gpt, r)).every(m => m.startsWith('openai/'))).toBe(true)
+  // 只装了 pi、配的是没定档位的提供商：排不出角色，提供商全关，外派工具不注册
+  const none = onlyDetected(cfg, ['zhipu/glm-5'], false)
+  expect(Object.keys(none.pi.roles).flatMap(r => chainFor(none, r))).toEqual([])
+})
+
+test('外派提示：附了提示的轮次记下建议的角色，当轮调了 pi_dispatch 记次数；报告算采纳率', async ($, on) => {
+  const h = harness(on, { cfg: DEFAULT_CONFIG })
+  on('store.get', (_, e) => ({ value: (e as { key: string }).key === 'channels' ? { pi: true, oc: false, at: 1 } : undefined }))
+  on('model.classify', () => ({ value: DEFAULT_CONFIG.claude.categories[1]?.label }))
+  await start($)
+  const a = await submit($, '把这段翻译成英文')
+  expect(a.context?.join(' ') ?? '').toContain('role=text')
+  await $.tool.call({ tool: 'mcp__auto-router__pi_dispatch', task: '' } as never).catch(() => undefined)
+  await complete($, 'claude-sonnet-5-5')
+  await submit($, '好的')
+  await complete($, 'claude-sonnet-5-5')
+  const rows = logRows(h)
+  expect(rows[0]).toMatchObject({ ph: 'text', pd: 1 })
+  expect(rows[1]?.ph).toBeUndefined()
+  expect(rows[1]?.pd).toBeUndefined()
+})
+
+test('外派提示统计：提示几轮、真派几轮、没提示也派了几轮，按角色分开', () => {
+  const t = (i: number, over: Record<string, unknown>): LogRecord =>
+    ({ t: 'turn', ts: i, model: 'claude-sonnet-5-5', in: 0, cw: 0, cr: 0, out: 0, sid: 's1', ...over }) as LogRecord
+  const d = delegateStats([t(1, { ph: 'review' }), t(2, { ph: 'review', pd: 1 }), t(3, { ph: 'text' }), t(4, { pd: 2 }), t(5, { ph: 'text', sub: true, pd: 1 }), t(6, {})], 0)
+  expect(d).toMatchObject({ hinted: 3, followed: 1, unprompted: 1 })
+  expect(d.byRole.review).toEqual({ hinted: 2, followed: 1 })
+  const text = delegateText(d)
+  expect(text).toContain('提示了 3 轮，当轮真派了 1 轮（33%）；没提示也派了 1 轮')
+  expect(text).toContain('review 1/2')
+  expect(delegateText(delegateStats([t(1, {})], 0))).toBe('')
 })

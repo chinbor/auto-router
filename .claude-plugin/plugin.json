@@ -1,7 +1,7 @@
 {
   "name": "auto-router",
   "version": "0.4.0",
-  "description": "按问题自动切换 Claude 模型，把适合的任务派给 pi agent（GPT / DeepSeek / Agnes）或 opencode 免费模型，拦大读取、提醒交接来省额度，并用对照实验衡量效果",
+  "description": "省 Claude 订阅额度：只在缓存要重建时换模型（难题用 Opus、其余 Sonnet），拦大读取、上下文过大时提醒交接或压缩，列出花费构成；装了 pi 或 opencode 时把执行活外派给更便宜的模型；用对照实验衡量效果。装好即用",
   "author": {
     "name": "chinbor",
     "url": "https://github.com/chinbor"

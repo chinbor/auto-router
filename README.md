@@ -32,12 +32,19 @@ flowchart LR
 /plugin install auto-router@auto-router
 ```
 
-装好后重开一个会话，运行 `/auto-router`：Claude 页顶部的“🚀 快速开始”四步（外派模型、数据目录、对照实验、每周报告）设完就能用，其余都有默认值。哪里不对先跑 `/auto-router doctor` 自检。
+**装好后重开一个会话就开始工作，不用配置**：换模型、省额度（拦大读取、上下文提醒、省额度规则、scout / executor 子代理）、效果日志都按默认值运行。想调的话运行 `/auto-router`，Claude 页顶部“🚀 快速开始”四步（外派模型、数据目录、对照实验、每周报告），都可以跳过。哪里不对先跑 `/auto-router doctor` 自检。
 
+**前提**
+- Claude Code 要支持插件 mod（hooks 模块）。作者在 Claude Code 2.1.309 及以后的版本、Windows 11 上用和测试；macOS / Linux 的路径处理写了，但还没实测。
+- 订阅登录（Pro / Max）。插件按 1 小时提示缓存算花费；用 API key 的，把 `claude.coldGapMinutes` 改成 5。
+
+**外派是可选的**：会话开始几秒后，插件在后台检测本机有没有 pi 和 opencode。
+- 都没装：不注册外派工具，Claude 也不会被提示去外派，其余功能照常。以后装上了，下个会话自动检测到。
+- 第一次运行时只开着检测到的提供商，并按档位排好各角色的模型；没定档位的模型到「外派模型」页选一下档位就能用。
 - 走 pi 需要本机能运行 `pi`，并且已配好对应提供商的 key（`pi --list-models` 能列出的模型才能用）。
 - 走 opencode 需要本机能运行 `opencode`（`npm i -g @opencode/cli`，旧包名 `opencode-ai` 也行），免费模型不用 key（`opencode models` 里 `opencode/` 开头、能列出的才会用）。
-- 两个都没装也能用模型切换和省额度。
-- 看图工具 `scripts/img_check.py` 需要 Python；处理视频截帧需要 ffmpeg。
+
+**其他**：看图工具 `scripts/img_check.py` 需要 Python；处理视频截帧需要 ffmpeg。界面和提示都是中文。
 
 ## 文档
 

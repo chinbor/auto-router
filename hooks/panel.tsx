@@ -4,7 +4,7 @@ import type { EngineInterface } from 'claude-code'
 import type { ModelMode, ModelRefresh, SettingsTab } from '../types'
 import { atLeast, buildRoles, CLAUDE_ALIASES, channelOf, claudeModelsFrom, isPeak, privacyBlock, providerOf, setPath } from './config'
 import type { Billing, Config, Tier } from './config'
-import { costSplit, demotedModels, experimentReport, modelVersions, redoStats, summarize, verdict, versionLabel } from './stats'
+import { costSplit, delegateStats, demotedModels, experimentReport, modelVersions, redoStats, summarize, verdict, versionLabel } from './stats'
 import { categoryIcon, modelTag } from './statusline'
 import type { Arm } from './stats'
 import { armLabel, clock, config, currentVersion, dataRoot, editConfig, logDir, reportDir, probeModel, readLogs, refreshOpencodeModels, refreshPiModels, rt, sessionTags } from './core'
@@ -961,6 +961,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     const logs = await readLogs($, from)
     const s = summarize(logs, from)
     const split = costSplit(logs, from)
+    const dg = delegateStats(logs, from)
     const redo = new Map(redoStats(logs, from).map(r => [r.model, r]))
     const demote = demotedModels([...redo.values()])
     const money = (n: number) => (n < 0.01 ? '<$0.01' : `$${n.toFixed(2)}`)
@@ -1066,7 +1067,9 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             '🚀 外派成功',
             s.pi.routed ? pct(s.pi.routedOk, s.pi.routed) : '–',
             s.pi.routed ? 'magenta' : undefined,
-            s.pi.routed ? `按角色派的 ${s.pi.routedOk} / ${s.pi.routed} 个` : '没按角色派过',
+            [s.pi.routed ? `按角色派的 ${s.pi.routedOk} / ${s.pi.routed} 个` : '没按角色派过', dg.hinted ? `提示 ${dg.hinted} 轮、派了 ${dg.followed} 轮` : '']
+              .filter(Boolean)
+              .join('；'),
           )}
           {s.week &&
             tile(

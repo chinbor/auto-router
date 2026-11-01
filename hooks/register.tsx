@@ -45,6 +45,9 @@ import {
   refreshOpencodeModels,
   refreshPiModels,
   registerTools,
+  initChannels,
+  detectChannels,
+  canDelegate,
   reportDir,
   resetSession,
   rt,
@@ -85,6 +88,9 @@ const writing = new Set<string>()
 let seq = 0
 let lastCost: number | undefined
 let lastMainModel: string | undefined
+/** 本轮附的外派提示（建议的角色）和调了几次 pi_dispatch：记进这轮的日志，看提示有没有被采纳 */
+let hintRole: string | undefined
+let dispatched = 0
 /** 主对话上一轮的分组：子代理的轮次跟着它记，免得对照组会话里的子代理被记成 auto */
 let lastMainArm: ReturnType<typeof armOf> | undefined
 /** 本会话最近派过的任务：判断新派的是不是返工（重载会丢，最多漏记几次） */
@@ -522,26 +528,26 @@ export const register: Register = on => {
     lastCost = (await $.session.usage().catch(() => undefined))?.cost?.usd
     lastMainModel = undefined
     lastMainArm = undefined
+    hintRole = undefined
+    dispatched = 0
     ocChecked = false
     await $.command.register({
       name: 'auto-router',
       description: '模型路由、外派（pi / opencode）与省额度：打开设置面板；pi 配外派模型、stats 看效果、eval 出对照实验报告、run 派任务、weekly 设每周报告、doctor 自检、export / import 分享配置',
       argumentHint: '[pi | stats | eval [天数] | jobs | run [角色] <任务> | weekly [周报目录] | doctor | export [文件] | import <文件> | path]',
     })
+    await initChannels($)
     await registerTools($, await config($))
     // 配置里改了 dataDir：把默认目录里的旧日志搬过去
     const moved = await moveLogs($).catch(() => 0)
     if (moved) $.ui.toast(`auto-router 已把 ${moved} 个日志文件搬到新的数据目录 ${await logDir($)}`)
-    if (consumeCreated()) {
+    const firstRun = consumeCreated()
+    if (firstRun) {
       rt.firstRun = true
-      $.ui.toast('auto-router 已装好：运行 /auto-router，在「外派模型」页按你的订阅配一下外派用哪些模型（pi 和 opencode）')
+      $.ui.toast('auto-router 已装好：换模型和省额度已经在工作。装了 pi 或 opencode 的，运行 /auto-router 在「外派模型」页确认一下外派用哪些模型')
     }
-    await $.tool.register({
-      name: 'pi_result',
-      isDeferred: false,
-      description: 'Get the status and output of a job (pi or opencode) started by pi_dispatch with background=true, or one queued for off-peak hours.',
-      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
-    })
+    // 等会话起来几秒再检测，不拖慢启动（opencode models 要好几秒）
+    void $.clock.after(5_000, () => void detectChannels($, firstRun).catch(() => undefined))
     await $.tool.register({
       name: 'router_config',
       isDeferred: true,
@@ -573,6 +579,8 @@ export const register: Register = on => {
     if (hints.length) e = { ...e, context: [...(e.context ?? []), ...hints] }
     await gapNotice($, cfg).catch(() => undefined)
     const mode = await read($, modelMode)
+    hintRole = undefined
+    dispatched = 0
     const wantPi = await read($, piAuto)
     if (mode === 'off' && !wantPi) return next(e)
 
@@ -590,7 +598,8 @@ export const register: Register = on => {
     await update($, lastDecision, () => decision)
 
     const result = await next(e)
-    if (!wantPi || !decision.piRole || result.drop !== undefined) return result
+    if (!wantPi || !decision.piRole || result.drop !== undefined || !canDelegate(cfg)) return result
+    hintRole = decision.piRole
     const hint =
       `[auto-router] 这个请求看起来适合外派：如果它能写成自包含的任务说明，` +
       `可调用 mcp__auto-router__pi_dispatch（role=${decision.piRole}）交给 pi 执行，再验收结果。`
@@ -650,6 +659,8 @@ export const register: Register = on => {
       fu: d?.fu,
       cold: d?.cold,
       rc: d?.rc,
+      ph: sub ? undefined : hintRole,
+      pd: sub ? undefined : dispatched || undefined,
       ctx: usage?.context.tokens,
       in: u.input_tokens,
       cw: u.cache_creation_input_tokens,
@@ -659,6 +670,8 @@ export const register: Register = on => {
       wk: usage?.rateLimits.find(r => r.kind === 'seven_day')?.percentUsed,
     })
     if (!sub) {
+      hintRole = undefined
+      dispatched = 0
       const ctx = usage?.context.tokens
       const ts = await nowMs($)
       await update($, coldMark, m => ({ ...m, ts, ctx }))
@@ -707,6 +720,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__auto-router__pi_dispatch' }, async ($, e) => {
     const input = e as unknown as DispatchInput & { background?: boolean }
+    dispatched++
     if (typeof input.task !== 'string' || !input.task.trim()) return { deny: 'task 不能为空' }
     const started = await startJob($, input, input.background === true)
     if ('refused' in started) return { result: `没派：${started.refused}` }

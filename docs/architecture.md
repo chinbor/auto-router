@@ -196,6 +196,8 @@ sequenceDiagram
 |---|---|
 | `cat` / `pick` / `model` | 分类、路由选的模型、实际模型 |
 | `cf` / `cerr` / `cms` / `via` / `fu` | 分类失败原因、报错、耗时、走的哪条路、fork 的 token 用量 |
+| `cold` / `rc` | 冷点原因（start / gap / compact）、本地规则判的类别 |
+| `ph` / `pd` | 这轮附了外派提示时建议的角色、这轮调了几次 `pi_dispatch`；报告里据此算提示采纳率 |
 | `in` / `cw` / `cr` / `out` / `usd` | 输入、缓存写、缓存读、输出 token，这一轮的花费 |
 | `ctx` / `wk` | 本轮开始时的上下文 token 数、7 天额度百分比 |
 | `sid` / `ex` / `ra` / `sv` | 会话、实验、切换组、省额度组 |

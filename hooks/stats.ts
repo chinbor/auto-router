@@ -34,6 +34,10 @@ export type TurnRecord = {
   cold?: string
   /** 本地规则判的类别；cat 是小模型分出来的时候，两者对比得出规则一致率 */
   rc?: string
+  /** 这轮在用户消息旁附了“适合外派”的提示，值是建议的角色 */
+  ph?: string
+  /** 这轮里调了几次 pi_dispatch（含子代理里调的） */
+  pd?: number
   /** 这轮开始时的上下文 token 数 */
   ctx?: number
   in: number
@@ -825,6 +829,51 @@ export function redoText(rows: RedoRow[]): string {
   ].join('\n')
 }
 
+
+// ---------- 外派提示：提示了几次、真派了几次 ----------
+
+export type DelegateStats = {
+  /** 附了外派提示的主对话轮次 */
+  hinted: number
+  /** 其中当轮真派了的 */
+  followed: number
+  /** 没提示也派了的轮次 */
+  unprompted: number
+  /** 按建议的角色：提示几次、派了几次 */
+  byRole: Record<string, { hinted: number; followed: number }>
+}
+
+export function delegateStats(records: LogRecord[], from: number): DelegateStats {
+  const s: DelegateStats = { hinted: 0, followed: 0, unprompted: 0, byRole: {} }
+  for (const r of records) {
+    if (r.t !== 'turn' || r.sub || r.ts < from) continue
+    const did = (r.pd ?? 0) > 0
+    if (!r.ph) {
+      if (did) s.unprompted++
+      continue
+    }
+    const role = (s.byRole[r.ph] ??= { hinted: 0, followed: 0 })
+    s.hinted++
+    role.hinted++
+    if (did) {
+      s.followed++
+      role.followed++
+    }
+  }
+  return s
+}
+
+export function delegateText(d: DelegateStats): string {
+  if (!d.hinted && !d.unprompted) return ''
+  const roles = Object.entries(d.byRole)
+    .sort((a, b) => b[1].hinted - a[1].hinted)
+    .map(([role, v]) => `${role} ${v.followed}/${v.hinted}`)
+  return [
+    `外派提示：提示了 ${d.hinted} 轮，当轮真派了 ${d.followed} 轮${d.hinted ? `（${Math.round((d.followed / d.hinted) * 100)}%）` : ''}；没提示也派了 ${d.unprompted} 轮`,
+    ...(roles.length ? [`  按角色（派了/提示）：${roles.join('，')}`] : []),
+    '  提示了却很少派：多半是活更适合自己做（判断、设计），或任务说明不好写；派了又常返工的看上面“外派返工”。',
+  ].join('\n')
+}
 
 // ---------- 花费构成：额度花在哪 ----------
 
