@@ -30,9 +30,6 @@ export type PeakSchedule = {
 /** free 免费 / subscription 订阅 / token 按量付费；同一档里按这个顺序排 */
 export type Billing = 'free' | 'subscription' | 'token'
 
-/** 外派通道：opencode/ 开头的模型走 opencode run，其余走 pi */
-export type Channel = 'pi' | 'opencode'
-
 export type Provider = {
   enabled: boolean
   billing: Billing
@@ -91,8 +88,13 @@ export type Config = {
     }
     /** 角色链上的模型此刻都用不了（关掉、高峰、熔断）时的兜底，按顺序试；兜底也用不了才排队 */
     fallback: string[]
-    /** 提供商报鉴权 / 额度类错误后暂停多少分钟 */
+    /** 提供商报鉴权 / 额度 / 限流错误或连不上后暂停多少分钟；按上游组暂停（见 groupOf），不连累同一家的其他组 */
     pauseMinutes: number
+    /**
+     * 按模型算免费的规则（"*" 匹配任意字符），优先于提供商的 billing：magpie 这类网关一家里混着免费和付费模型。
+     * 默认把 magpie/opencode-zen-free/* 算免费
+     */
+    freeModels: string[]
     /** 模型档位，同一档里排在前面的更强；外派模型页据此排角色 */
     tiers: Record<string, Tier>
     /** 模型擅长的角色（实测得出）：同档同计费方式里，擅长这个角色的排前面，只擅长别的角色的排后面；fallback 表示适合当兜底 */
@@ -128,16 +130,18 @@ const TERRA = 'openai/gpt-6.1-terra'
 const DS_FLASH = 'cc-switch-deep-seek/deepseek-flash'
 const AG3 = 'agnes/agnes-3.0-flash'
 const AG25 = 'agnes/agnes-2.5-flash'
-// opencode 的免费模型（走 opencode run，不走 pi）
-const OC_DS = 'opencode/deepseek-v4.1-flash-free'
-const OC_GLM = 'opencode/glm-5.3-flash-free'
-const OC_MIMO = 'opencode/mimo-v2.6-flash-free'
-const OC_FLINT = 'opencode/flint-40b-free'
-const OC_VL = 'opencode/nemotron-3.5-super-vl-free'
-const OC_LIGHT = 'opencode/nemotron-3.5-lightning-free'
-const OC_BEAM = 'opencode/beam-free'
+// OpenCode Zen 的免费模型，经本地网关 magpie 在 pi 里用；输出上限 glm、mimo、deepseek-v4.1 只有 32K
+const FREE_GROUP = 'magpie/opencode-zen-free'
+const FREE = `${FREE_GROUP}/`
+const OC_DS = FREE + 'deepseek-v4.1-flash-free'
+const OC_GLM = FREE + 'glm-5.3-flash-free'
+const OC_MIMO = FREE + 'mimo-v2.6-flash-free'
+const OC_FLINT = FREE + 'flint-40b-free'
+const OC_VL = FREE + 'nemotron-3.5-super-vl-free'
+const OC_LIGHT = FREE + 'nemotron-3.5-lightning-free'
+const OC_BEAM = FREE + 'beam-free'
 
-// 原则：同一档里 免费 → 订阅 → 按量付费。opencode 免费模型兜底或打头，gpt、agnes 订阅留给重要的活，
+// 原则：同一档里 免费 → 订阅 → 按量付费。免费模型兜底或打头（长输出的编码、批量不让 32K 上限的排第一），gpt、agnes 订阅留给重要的活，
 // 按量付费的 deepseek 尽量靠后，且只在空闲时段用。deepseek-v4-pro 比 flash 贵，默认不用。
 // 强度 gpt > deepseek ≈ 免费的中档 > agnes；terra 比 sol 快、便宜，看图和操作电脑更强，sol 推理更强。
 export const DEFAULT_CONFIG: Config = {
@@ -178,7 +182,11 @@ export const DEFAULT_CONFIG: Config = {
           holidays: [],
         },
       },
-      opencode: { enabled: true, billing: 'free', note: '免费模型走 opencode run；随时可能下架；某个模型免费额度用完只停那一个' },
+      magpie: {
+        enabled: true,
+        billing: 'token',
+        note: '本地网关：opencode-zen-free/ 下的按 freeModels 算免费（随时可能下架），其余按这里的计费方式',
+      },
     },
     roles: {
       review: {
@@ -219,9 +227,10 @@ export const DEFAULT_CONFIG: Config = {
       },
     },
     guard: { requireCleanGit: true },
-    // gpt 退订、deepseek 高峰时，各角色最后靠 agnes 订阅顶上，再不行用 opencode 免费模型
+    // gpt 退订、deepseek 高峰时，各角色最后靠 agnes 订阅顶上，再不行用免费模型
     fallback: [AG3, AG25, OC_MIMO, OC_FLINT],
     pauseMinutes: 30,
+    freeModels: [`${FREE}*`],
     tiers: {
       [SOL]: 'strong',
       [TERRA]: 'strong',
@@ -318,13 +327,15 @@ export async function loadConfig($: EngineInterface, isWindows: boolean): Promis
       experiment: raw.experiment ?? (legacyAb ? 'route' : DEFAULT_CONFIG.experiment),
       dataDir: raw.dataDir ?? DEFAULT_CONFIG.dataDir,
     }
-    const { cfg, note } = raw.pi && !raw.pi.providers?.opencode ? migrateOpencode(merged) : { cfg: merged, note: undefined }
+    const repair = raw.pi?.freeModels !== undefined
+    const { cfg, note } = needsMigrate(raw) ? migrateFree(merged, repair) : { cfg: merged, note: undefined }
     const errs = validate(cfg)
     if (errs.length) throw new Error(errs.slice(0, 3).join('；'))
     warned = false
     if (note) {
-      // 迁移只做一次：写回后文件里就有 opencode 段了；旧文件留一份 .bak
-      await $.fs.write(`${path}.bak`, JSON.stringify(raw, null, 2) + '\n').catch(() => undefined)
+      // 迁移只做一次：写回后文件里就有 freeModels 了；旧文件留一份 .bak。只清旧条目时已有的 .bak（迁移前的原文件）不覆盖
+      if (!repair || !(await $.fs.exists(`${path}.bak`).catch(() => false)))
+        await $.fs.write(`${path}.bak`, JSON.stringify(raw, null, 2) + '\n').catch(() => undefined)
       await saveConfig($, isWindows, cfg).catch(() => undefined)
       say($, note)
     }
@@ -349,27 +360,86 @@ const LEGACY_ROLES: Record<string, string[]> = {
 }
 const LEGACY_FALLBACK = [AG3, AG25]
 
+/** 0.5 之前的配置（文件里没有 pi.freeModels）要迁移一次 */
+export function needsMigrate(raw: { pi?: Partial<Config['pi']> }): boolean {
+  if (!raw.pi) return false
+  return raw.pi.freeModels === undefined || hasLegacy(raw.pi)
+}
+
+const isLegacyModel = (m: string) => m.startsWith('opencode/') || m.startsWith('oc:')
+
 /**
- * 0.2.x 的配置（没有 opencode 段）升到 0.3：加上 opencode 提供商、免费模型的档位和擅长标签；
- * 用户已经有的提供商、档位不动。角色还是旧默认时按新档位重排，手调过的不动，只提示一句。
+ * 迁移过、又被还开着的 0.4 会话写回了旧条目：0.4 读配置时补上自己的默认值（opencode 提供商、opencode/ 的档位和擅长）再存回去，
+ * 只看 freeModels 判断不出来
  */
-export function migrateOpencode(cfg: Config): { cfg: Config; note?: string } {
-  if (cfg.pi.providers.opencode) return { cfg }
-  const ocTiers = Object.fromEntries(Object.entries(DEFAULT_CONFIG.pi.tiers).filter(([m]) => channelOf(m) === 'opencode'))
+function hasLegacy(pi: Partial<Config['pi']>): boolean {
+  const models = [...(pi.fallback ?? []), ...Object.values(pi.roles ?? {}).flatMap(r => r?.models ?? [])]
+  return (
+    Object.keys(pi.providers ?? {}).some(isOcProvider) ||
+    [...Object.keys(pi.tiers ?? {}), ...Object.keys(pi.strengths ?? {})].some(isLegacyModel) ||
+    models.some(isLegacyModel)
+  )
+}
+
+/**
+ * 旧的模型名换成 0.5 的写法：opencode/<x> 换成 magpie/opencode-zen-free/<x>；
+ * oc:（opencode 里配的其他提供商）没有对应的 pi 模型，返回 undefined 表示去掉
+ */
+export function migrateModel(m: string): string | undefined {
+  if (m.startsWith('oc:')) return undefined
+  return m.startsWith('opencode/') ? FREE + m.slice('opencode/'.length) : m
+}
+
+const isOcProvider = (p: string) => p === 'opencode' || p.startsWith('oc:')
+
+/**
+ * 升到 0.5（opencode 通道并进 pi）：角色链、兜底、档位、擅长标签里的模型名换成 magpie 的写法，
+ * 删掉 opencode 和 oc: 提供商，加上 magpie 和 freeModels。0.2.x 的配置顺带补上免费模型的档位和擅长标签。
+ * 用户自己的提供商、档位、顺序都不动；角色还是 0.2.x 的旧默认时按档位重排。
+ * repair：文件里已经有 freeModels（迁移过），只是又被旧版会话写回了旧条目，只清旧条目
+ */
+export function migrateFree(cfg: Config, repair = false): { cfg: Config; note?: string } {
+  const mapList = (list: string[]) => [...new Set(list.map(migrateModel).filter((m): m is string => !!m))]
+  // 新旧写法都在时（迁移过又被旧版写回）以新写法的为准：那是 0.5 里设的
+  const mapKeys = <T>(rec: Record<string, T>) =>
+    Object.fromEntries(
+      Object.entries(rec).flatMap(([m, v]) => {
+        const to = migrateModel(m)
+        return to && (to === m || !(to in rec)) ? [[to, v]] : []
+      }),
+    )
+  const roles = Object.fromEntries(
+    Object.entries(cfg.pi.roles).map(([name, r]) => {
+      const models = mapList(r.models)
+      // 整条链都是 oc: 模型：换成默认角色的链，免得校验不过整份配置作废
+      return [name, { ...r, models: models.length ? models : (DEFAULT_CONFIG.pi.roles[name]?.models ?? [OC_MIMO]) }]
+    }),
+  )
+  const providers = Object.fromEntries(Object.entries(cfg.pi.providers).filter(([p]) => !isOcProvider(p)))
+  const hadFree = Object.keys(cfg.pi.tiers).some(m => m.startsWith('opencode/'))
+  const freeTiers = Object.fromEntries(Object.entries(DEFAULT_CONFIG.pi.tiers).filter(([m]) => m.startsWith(FREE)))
   const next: Config = {
     ...cfg,
     pi: {
       ...cfg.pi,
-      providers: { ...cfg.pi.providers, opencode: DEFAULT_CONFIG.pi.providers.opencode as Provider },
-      tiers: { ...cfg.pi.tiers, ...ocTiers },
-      strengths: { ...DEFAULT_CONFIG.pi.strengths, ...cfg.pi.strengths },
+      providers: { ...providers, magpie: providers.magpie ?? (DEFAULT_CONFIG.pi.providers.magpie as Provider) },
+      roles,
+      fallback: mapList(cfg.pi.fallback),
+      tiers: { ...(hadFree ? {} : freeTiers), ...mapKeys(cfg.pi.tiers) },
+      strengths: { ...DEFAULT_CONFIG.pi.strengths, ...mapKeys(cfg.pi.strengths ?? {}) },
+      freeModels: cfg.pi.freeModels ?? DEFAULT_CONFIG.pi.freeModels,
     },
   }
+  if (repair)
+    return { cfg: next, note: 'auto-router 0.5：配置里又出现了 opencode 的旧条目（多半是还开着的旧版会话写回的），已清掉；你在 0.5 里的设置没动' }
   const untouched =
     JSON.stringify(cfg.pi.fallback) === JSON.stringify(LEGACY_FALLBACK) &&
     Object.entries(LEGACY_ROLES).every(([name, models]) => JSON.stringify(cfg.pi.roles[name]?.models) === JSON.stringify(models))
-  if (untouched) return { cfg: buildRoles(next), note: 'auto-router 0.3：加上了 opencode 免费模型，各角色已按新档位重排（旧配置备份为 .bak）' }
-  return { cfg: next, note: 'auto-router 0.3：加上了 opencode 免费模型的档位；你手调过角色顺序，没动，到 /auto-router「外派模型」页点“按档位重排”即可用上' }
+  if (untouched) return { cfg: buildRoles(next), note: 'auto-router 0.5：加上了免费模型（经 magpie 在 pi 里用），各角色已按档位重排（旧配置备份为 .bak）' }
+  return {
+    cfg: next,
+    note: 'auto-router 0.5：opencode 通道并进 pi，免费模型改成 magpie/opencode-zen-free/ 的写法，角色顺序没动（旧配置备份为 .bak）',
+  }
 }
 
 export async function saveConfig($: EngineInterface, isWindows: boolean, config: Config): Promise<void> {
@@ -407,6 +477,8 @@ export function validate(cfg: Config): string[] {
   if (!roles[cfg.pi?.defaultRole]) errs.push(`pi.defaultRole「${cfg.pi?.defaultRole}」不是已有角色`)
   if (typeof cfg.pi?.guard?.requireCleanGit !== 'boolean') errs.push('pi.guard.requireCleanGit 要是 true / false')
   if (!Number.isFinite(cfg.pi?.pauseMinutes) || cfg.pi.pauseMinutes < 0) errs.push('pi.pauseMinutes 要是 ≥0 的数字')
+  if (!Array.isArray(cfg.pi?.freeModels) || !cfg.pi.freeModels.every(x => typeof x === 'string' && x.includes('/')))
+    errs.push('pi.freeModels 要是模型规则列表，如 "magpie/opencode-zen-free/*"，可以为空 []')
   if (!Array.isArray(cfg.pi?.fallback)) errs.push('pi.fallback 要是模型列表，可以为空 []')
   else
     cfg.pi.fallback.forEach(m => {
@@ -544,33 +616,50 @@ export function providerOf(model: string): string {
 }
 
 /**
- * opencode 里配的其他提供商（你自己的账号，如 alibaba、zai）在本插件里写成 "oc:alibaba/qwen3-max"，
- * 和 pi 里同名的提供商分开记付费方式；opencode 自己的免费模型仍是 "opencode/xxx"
+ * 熔断按上游组算：三段的模型名（magpie/opencode-zen-free/glm-5.3-flash-free）取前两段，
+ * 网关里一组限流不连累同一家的其他组；两段的就是提供商
  */
-export const OC_PREFIX = 'oc:'
-
-/** 模型走哪个通道：opencode/ 和 oc: 开头的走 opencode run，其余走 pi */
-export function channelOf(model: string): Channel {
-  return providerOf(model) === 'opencode' || model.startsWith(OC_PREFIX) ? 'opencode' : 'pi'
+export function groupOf(model: string): string {
+  const parts = model.split('/')
+  return parts.length >= 3 ? `${parts[0]}/${parts[1]}` : (parts[0] ?? model)
 }
 
-/** 传给 opencode run -m 的模型名：去掉 oc: 前缀 */
-export function ocModelArg(model: string): string {
-  return model.startsWith(OC_PREFIX) ? model.slice(OC_PREFIX.length) : model
+/**
+ * 免费额度用完（OpenCode Zen 报 “Free usage limit”）：额度按模型算，只停这一个模型；
+ * 要十几个小时才恢复，按 pauseMinutes 每半小时白试一次不划算
+ */
+export const FREE_LIMIT = /free.?(usage.?)?limit/i
+export const FREE_LIMIT_PAUSE_MINUTES = 6 * 60
+
+/** 报错后暂停多少分钟：免费额度用完至少停 6 小时，其余按 pi.pauseMinutes；pauseMinutes 为 0 表示不暂停 */
+export function pauseMinutesFor(err: string, pauseMinutes: number): number {
+  if (pauseMinutes <= 0) return 0
+  return FREE_LIMIT.test(err) ? Math.max(pauseMinutes, FREE_LIMIT_PAUSE_MINUTES) : pauseMinutes
 }
 
-/** 带通道标签的模型名，如 "[opencode] opencode/glm-5.3-flash-free" */
-export function tagged(model: string): string {
-  return `[${channelOf(model)}] ${model}`
+/** 暂停时弹的提示。key 是上游组（三段名的前两段）、整家，或免费额度用完的单个模型；conn 表示是连不上，不是鉴权、额度、限流 */
+export function pauseText(key: string, err: string, conn: boolean, until: string): string {
+  const head = conn ? `${key} 连不上` : FREE_LIMIT.test(err) ? `${key} 免费额度用完了` : `${key} 报鉴权/额度/限流错误`
+  const rest = FREE_LIMIT.test(err) && !conn
+    ? '其他免费模型照常用（免费额度按模型算）。'
+    : key.includes('/')
+    ? '同一家的其他模型照常用。'
+    : conn
+      ? '派活先换别家；检查网络、代理或这家的地址。'
+      : '如果已经退订，到 /auto-router「外派模型」页 ① 把这家的计费方式改成“不用”。'
+  return `${head}，暂停到 ${until}，${rest}`
 }
 
-/** 解析 `opencode models` 的输出：一行一个 provider/id；opencode 自己的原样，其他提供商加 oc: 前缀 */
-export function parseOpencodeModels(stdout: string): string[] {
-  return stdout
-    .split(/\r?\n/)
-    .map(l => l.trim())
-    .filter(l => /^[\w.-]+\/\S+$/.test(l))
-    .map(l => (l.startsWith('opencode/') ? l : `${OC_PREFIX}${l}`))
+/** "*" 匹配任意字符的规则 */
+function globMatch(pattern: string, s: string): boolean {
+  const re = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')
+  return new RegExp(`^${re}$`).test(s)
+}
+
+/** 模型的计费方式：先看 freeModels 规则，再看所在提供商；都没写按订阅 */
+export function billingOf(cfg: Config, model: string): Billing {
+  if ((cfg.pi.freeModels ?? []).some(p => globMatch(p, model))) return 'free'
+  return cfg.pi.providers[providerOf(model)]?.billing ?? 'subscription'
 }
 
 function minutes(hhmm: string): number {
@@ -621,10 +710,15 @@ export function liveChain(
   skip: (model: string) => boolean = () => false,
   demote: Set<string> = new Set(),
 ): { models: string[]; isFallback: boolean } {
-  const primary = chainFor(cfg, role, now).filter(m => !isDown(providerOf(m)) && !isDown(m) && !skip(m))
+  const primary = chainFor(cfg, role, now).filter(m => !downFor(isDown, m) && !skip(m))
   // 返工多的模型排到链尾，不删掉：别的都用不了时照样能接
   if (primary.length) return { models: [...primary.filter(m => !demote.has(m)), ...primary.filter(m => demote.has(m))], isFallback: false }
   return { models: usableFallback(cfg, now, isDown, skip), isFallback: true }
+}
+
+/** 模型有没有被熔断：整家（旧记录）、上游组或这一个模型 */
+export function downFor(isDown: (key: string) => boolean, m: string): boolean {
+  return isDown(providerOf(m)) || isDown(groupOf(m)) || isDown(m)
 }
 
 /** 此刻能用的兜底模型：去掉关掉的、在高峰的、已暂停的、被 skip 拦下的 */
@@ -636,7 +730,7 @@ export function usableFallback(
 ): string[] {
   return cfg.pi.fallback.filter(m => {
     const p = cfg.pi.providers[providerOf(m)]
-    return p?.enabled !== false && !isPeak(p?.peak, now) && !isDown(providerOf(m)) && !isDown(m) && !skip(m)
+    return p?.enabled !== false && !isPeak(p?.peak, now) && !downFor(isDown, m) && !skip(m)
   })
 }
 
@@ -682,7 +776,7 @@ const BILLING_RANK: Record<Billing, number> = { free: 0, subscription: 1, token:
  * 只擅长别的角色的在后；再往下保持 tiers 里的先后（cheaper 时倒过来）
  */
 function tierModels(cfg: Config, tier: Tier, cheaper: boolean, role?: string, billing?: BillingPick): string[] {
-  const bill = (m: string) => cfg.pi.providers[providerOf(m)]?.billing ?? 'subscription'
+  const bill = (m: string) => billingOf(cfg, m)
   const list = Object.entries(cfg.pi.tiers)
     .filter(([m, t]) => t === tier && cfg.pi.providers[providerOf(m)]?.enabled !== false)
     .map(([m]) => m)
@@ -699,13 +793,13 @@ function tierModels(cfg: Config, tier: Tier, cheaper: boolean, role?: string, bi
 }
 
 /**
- * 第一次运行时按本机检测到的外派通道改默认配置：只开着检测到的提供商（pi 里列得出模型的那几家，装了 opencode 才开 opencode），
+ * 第一次运行时按本机 pi 里列得出模型的那几家改默认配置：只开着这些提供商，
  * 再按档位重排角色。一个能用的角色都排不出来时只关提供商、角色照旧，外派工具就不注册，等用户在「外派模型」页配好
  */
-export function onlyDetected(cfg: Config, piList: string[], oc: boolean): Config {
+export function onlyDetected(cfg: Config, piList: string[]): Config {
   const have = new Set(piList.map(providerOf))
   const providers = Object.fromEntries(
-    Object.entries(cfg.pi.providers).map(([p, v]) => [p, { ...v, enabled: p === 'opencode' || p.startsWith('oc:') ? oc : have.has(p) }]),
+    Object.entries(cfg.pi.providers).map(([p, v]) => [p, { ...v, enabled: have.has(p) }]),
   )
   const next = { ...cfg, pi: { ...cfg.pi, providers } }
   const built = buildRoles(next)

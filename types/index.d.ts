@@ -1,8 +1,6 @@
-/** 外派出去的一个任务（pi 或 opencode），pane 里一行 */
+/** 外派给 pi 的一个任务，pane 里一行；0.5 之前的记录可能多一个 channel 字段，读的时候不用 */
 export type PiJob = {
   id: string
-  /** 走哪个通道；旧记录没有，按模型前缀推断（opencode/ 开头是 opencode） */
-  channel?: 'pi' | 'opencode'
   /** 配置里的角色名，如 code / bulk / text；手动指定模型时为 custom */
   role: string
   /** 实际跑成功（或最后尝试）的模型 */
@@ -33,8 +31,6 @@ export type ProbeResult = {
   at: number
   /** 失败原因（报错原文前 120 字） */
   why?: string
-  /** opencode 免费额度用完时报的恢复等待时长 */
-  retryAfterMs?: number
   running?: boolean
 }
 
@@ -110,9 +106,7 @@ declare module 'claude-code' {
       configRev: number
       /** `pi --list-models` 里能用的模型，provider/id */
       piModels: Shaped<string[]>
-      /** `opencode models opencode` 里此刻还在的免费模型 */
-      ocModels: Shaped<string[]>
-      /** 因鉴权 / 额度错误被暂停的提供商：暂停到何时、为什么 */
+      /** 因鉴权 / 额度 / 限流错误或连不上被暂停的上游组（或旧记录里的整家提供商）：暂停到何时、为什么 */
       paused: Shaped<Record<string, { until: number; reason: string }>>
       /** pi 模型页显示全部模型的提供商 */
       setupOpen: string | null

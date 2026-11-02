@@ -109,54 +109,34 @@ sequenceDiagram
 
 `turn.step` 钩子在每一步把 `model` 换成本轮决定的模型。子代理的请求不改。对照组只记录"本来会选什么"，不改。
 
-## 2. 外派（pi / opencode）
+## 2. 外派（pi）
 
-- `pi_dispatch` 工具的说明是根据当前配置生成的，列出每个角色和它依次尝试的模型，每个模型前标 `[pi]` 或 `[opencode]`。配置变了就重新注册。工具名沿用 `pi_dispatch`，不改名，以免已有的提示词和技能失效。
-- **通道**：模型名以 `opencode/` 开头的走 `opencode run`，其余走 pi（`channelOf`）。一条链里可以混着两条通道，按顺序试。结果头写成 `[opencode p1a2b3c4] 完成 · opencode/glm-5.3-flash-free`，任务记录、状态行（`🚀 opencode · 文本 · glm-5.3-flash-free 运行中`）和日志（`ch` 字段，旧记录按模型前缀推断）都带通道。
-- **模型链**：每个角色按"强 / 中 / 轻"档位排；同一档里按计费 免费 → 订阅 → 按量付费，再按 `pi.strengths`（擅长这个角色的在前，没标的居中，专长别的角色的在后）。跳过关掉的提供商、处在高峰时段的提供商、被熔断暂停的提供商、已下架的免费模型；都用不了时用 `pi.fallback`；兜底也不行才排队到下一个空闲时段。
+- `pi_dispatch` 工具的说明是根据当前配置生成的，列出每个角色和它依次尝试的模型。配置变了就重新注册。工具名沿用 `pi_dispatch`，不改名，以免已有的提示词和技能失效。
+- **只有 pi 一个通道**（0.5 起）：免费模型经本地 magpie 网关接进 pi，名字是 `magpie/opencode-zen-free/<模型>`，和别的模型一样用 `pi -p --model …` 跑。结果头写成 `[pi p1a2b3c4] 完成 · magpie/opencode-zen-free/glm-5.3-flash-free`，状态行是 `🚀 pi · 文本 · glm-5.3-flash-free 运行中`。0.5 之前的任务记录和日志里的 `channel` / `ch` 字段读的时候不用，`opencode/` 开头的旧模型名照常统计。
+- **按模型判断免费**（`billingOf`）：模型名匹配 `pi.freeModels` 里任何一条（默认 `magpie/opencode-zen-free/*`，只认 `*` 通配）就算免费；不匹配的按所属提供商在 `pi.providers` 里的计费方式（magpie 默认按量付费），没配的提供商按订阅。面板里免费模型旁标“免费”，派活顺序里标 `[免费]`。
+- **模型链**：每个角色按"强 / 中 / 轻"档位排；同一档里按计费 免费 → 订阅 → 按量付费，再按 `pi.strengths`（擅长这个角色的在前，没标的居中，专长别的角色的在后）。跳过关掉的提供商、处在高峰时段的提供商、被熔断暂停的上游组、`pi --list-models` 里已经没有的模型；都用不了时用 `pi.fallback`；兜底也不行才排队到下一个空闲时段。
+- **输出上限**：glm-5.3、mimo-v2.6、deepseek-v4.1、big-pickle 这几个免费模型的输出上限是 32K（`pi --list-models` 的 max-out 列）。默认链里长输出的 code、bulk、review、vision 都不让它们打头；text、quick、longctx 打头的是它们，输出短，够用。一次翻译很长的文档时可能撞上限，失败后会换下一个。
 - **运行时兜底**（`runChain`）：角色链的模型依次试，一个失败换下一个；整条都失败后接着试 `pi.fallback` 里还没试过的。另外三条：
-  - 一家超时后，同一任务不再试这家的其他模型；
+  - 一个上游组超时后，同一任务不再试这组的其他模型；
   - 可写任务失败时如果工作区已经有改动，就停下来，不让下一个模型在半成品上接着改；
   - 指定了模型（`model` 参数）时只试那一个。
-- **熔断**：报鉴权或额度类错误（没有 / 无效的 api key、401/403、订阅失效、402、429、quota、usage limit、too many requests、没登录）时，整家暂停 `pauseMinutes` 分钟。pi 只看 stderr，退出码非 0 且 stdout 很短时才连 stdout 一起看，免得模型回答里提到 "rate limit" 也熔断。opencode 的免费模型算一家：任何一个限流，整个 opencode 暂停。opencode 只看 stderr 和 error 事件的消息，不看工具输出，免得读到的文件里碰巧有 "api key" 就熔断。
-- **安全**：只读角色强制禁用 edit / write / bash（pi 用 `--exclude-tools edit,write,bash`，opencode 见下）。可写角色要求工作目录是 git 仓库、工作区干净、同一仓库没有别的可写任务在跑；跑完附上 `git diff --stat`，由 Claude 审阅，不自动提交。两条通道一样。
-- **隔离用户自己装的东西**：外派出去的模型只该碰工作目录。实测两边默认都会带上用户的全局配置：
-  - pi 会加载 `~/.pi/agent` 下的扩展、MCP 和技能。作者机器上只读任务也拿得到 `subagent`、`act_ui`（操控桌面）、`launch_browser`、`web_search` 和知识库 MCP（含能写入的 `add_to_inbox`）。所以每次都加 `--no-mcp --no-extensions --no-skills --no-prompt-templates`，只把 `pi.keepExtensions` 里的扩展（默认只拦危险命令的 `cc-safety-net`）用 `-e` 加回来。项目和全局的 AGENTS.md 照常读。
-  - opencode 见下一节。
-- **超时能杀干净**：Windows 上 npm 装的 `pi`、`opencode` 是 `.cmd` 外壳。经 `cmd /d /c` 起的话，超时只杀掉 cmd，真正干活的 node / opencode.exe 成了孤儿，管道不关，任务一直挂着（实测：kill 后 opencode.exe 还在、close 事件不来）。所以先 `where xxx.cmd`，从外壳里读出真正的程序（`.exe` 直接起，`.js` 交给外壳旁的 node.exe）直接起（`launcher` / `parseShim`）；读不出来才退回 `cmd /d /c`。每个会话开始时重新找一次。
-- Windows 上每次调 pi / opencode 前从注册表读一遍用户级环境变量，Claude 启动后才设置的 key 也能用上。
-
-### opencode 通道
-
-实测 opencode 1.19.5 和 2.2.5（Windows 11）：
-
-- 直接起 `opencode.exe`（不经 cmd，见上）；任务从 stdin 传，不拼进命令行（避免引号和长度问题）。按 `--version` 的大版本拼参数：
-  - 1.x：`run -m <模型> --format json --dir <目录> --agent <代理>`；
-  - 2.x：`run -m <模型> --format json --agent <代理> --standalone`，目录取进程的工作目录（2.x 去掉了 `--dir`）。2.x 的 `run` 默认连后台常驻服务，我们注入的环境变量（代理配置、隔离的配置目录）到不了那个服务，报 "Agent not found"；`--standalone` 起一个自己的服务，环境变量才生效。
-- opencode 会自己升级，2.x 换了包名（`@opencode/cli`），程序路径跟着变。所以每次起之前检查缓存的程序路径还在不在，不在就重新从 `.cmd` 外壳里找；同时设 `OPENCODE_DISABLE_AUTOUPDATE=1`，免得任务中途升级。
-- 免费模型有用量上限，**按模型算**：到了以后 error 事件是 `{"type":"provider.free-limit","message":"Free usage limit reached…","status":429,"retryAfterMs":…}`。实测（2026-11-01 晚）glm、deepseek-v4.1、mimo、nemotron-vl 已到上限时，flint、nemotron-lightning 照样能用；`retryAfterMs` 约 12.8 小时。所以撞到 free-limit 只暂停这一个模型（暂停表的键用完整模型名），按 `retryAfterMs` 恢复，不暂停整个 opencode。2.x 的 error 字段是 `type` / `message`，1.x 是 `name` / `data.message`，两种都读。
-- `--format json` 每行一个事件：`step_start`、`text`、`tool_use`、`step_finish`、`error`。取最后一步的文字当结果（前面几步多是“我先读一下文件”），最后一步没有文字时取全部文字（`parseOpencodeRun`）。成功退出码 0；模型不存在、限流时退出码 1 并带 `error` 事件。退出码 0 但没有文字也算失败，换下一个模型。
-- **只读不能用 `--agent plan`**：`opencode debug agent plan` 显示 plan 只 deny 了 edit，`"*"` 是 allow，bash 还能用，能用 shell 写文件。
-- **不带上用户的全局配置**：opencode 默认读 `~/.config/opencode/opencode.json`（作者机器上里面有知识库 MCP，每次 `opencode run` 都会起一个 MCP 进程）、全局 AGENTS.md（含个人规则）、插件，还兼容读 `~/.claude` 下的技能和 CLAUDE.md。这些都会跟着任务发给免费模型。所以每次都：
-  - `XDG_CONFIG_HOME` 指到插件自己的 `~/.claude/auto-router/opencode`（空配置；第一次用时 opencode 会在里面装一次依赖，要几十秒，所以打开面板时先跑一次 `opencode models`）；
-  - `OPENCODE_DISABLE_CLAUDE_CODE=1`；
-  - 用 `OPENCODE_CONFIG_CONTENT` 注入两个代理，权限都是先 `"*": "deny"` 再逐个放开：
-    - `auto-router-readonly`：只放开 read、grep、glob、list，读 `*.env` 也 deny；
-    - `auto-router-write`：再放开 edit、todowrite 和 bash。bash 明确设成 allow，因为用户配置里 bash 是 `"ask"` 时，`opencode run` 没人点允许，会一直卡着（实测）。第一条是 `"*": "allow"`（opencode 按最后一条匹配的规则算），后面 deny `git commit/push/reset/clean`、递归删除（`rm -r`、`Remove-Item -Recurse`、`rd /s`、`del /s`）和 `Format-Volume`，改动留给 Claude 审阅。
-  - 实测：只读代理的模型只看得到 glob、grep、read，没起任何 MCP，说不出全局规则的内容，读 `.env` 被拦；可写代理改文件、跑测试都正常，`git commit` 被拦。
-  - 项目目录里的 opencode.json、AGENTS.md 照常生效，那是被派活的项目自己的；项目里配的 MCP 也会起，但 `"*": "deny"` 让模型调不到。
-- **下架**：免费模型随时可能下架。打开面板时和每个会话第一次派 opencode 时列一次模型（1.x 用 `opencode models opencode`，约 1.4 秒；2.x 用 `opencode models --standalone` 再挑 `opencode/` 开头的），不在列表里的模型派活时跳过并在结果里写一笔“已下架”；列表取不到（没装 opencode）时不按下架处理。
-- **数据政策**：免费模型的提供方可能保存内容或拿来改进模型（见 [OpenCode Zen 文档](https://opencode.ai/docs/zen)），新上的模型也不知道政策如何，插件不再按名单区分（已去掉 `opencode.allowDirs` / `opencode.logged` 和“会保存内容”标签）。不想把某个项目的内容发给免费模型时，在「外派模型」页把 opencode 这一家设成“不用”。
-- **你自己配的提供商**：隔离目录读不到全局 `opencode.json`，所以只把其中的 `provider` 一段经 `OPENCODE_CONFIG_CONTENT` 带过去（`userOcProviders`），magpie 这类中转和自加的 openai 兼容提供商因此能列出来、派得出去；MCP、插件照旧不带。
-- `OPENCODE_DISABLE_FREE_MODELS=1` 会让 opencode 不列免费模型；这时所有 opencode 模型都按“取不到列表”处理，派活时报错后换下一个。
+- **熔断按上游组**（`groupOf`）：模型名有三段以上时取前两段（`magpie/opencode-zen-free/glm-5.3-flash-free` 的组是 `magpie/opencode-zen-free`），两段的就是提供商（`agnes/agnes-3.0-flash` 的组是 `agnes`）。报鉴权、额度或限流类错误（没有 / 无效的 api key、401/403、订阅失效、402、429、quota、usage limit、free limit、too many requests、没登录），或连不上（ECONNREFUSED、ECONNRESET、ENOTFOUND、fetch failed 等）时，暂停这一组 `pauseMinutes` 分钟；免费额度用完（“Free usage limit”）是例外：额度按模型算，只停那一个模型（暂停表的键是完整模型名），要十几个小时才恢复，所以至少停 6 小时（`pauseMinutesFor`），免得每半小时白试一次。暂停时弹的提示（`pauseText`）分连不上、免费额度用完、鉴权或限流三种说法，只有两段名的提供商报鉴权错误时才提“如果已经退订”。所以免费组限流或 magpie 网关没开时，只停 `magpie/opencode-zen-free`，magpie 里别的上游照常用，别家完全不受影响。只看 stderr，退出码非 0 且 stdout 很短时才连 stdout 一起看，免得模型回答里提到 "rate limit" 也熔断。0.5 之前按整家记下的暂停（键是提供商名）照样认，到点自动恢复。
+- **下架**：免费模型随时可能下架。每个会话第一次派活时列一次 `pi --list-models`（面板点“刷新模型列表”时也会重读），不在列表里的模型跳过并在结果里写一笔“pi --list-models 里已经没有这个模型”；列表取不到或是空的时不按下架处理，派活时报错后换下一个。
+- **测连通**：「外派模型」页每家提供商一行上有“测连通”，拿这家选了档位的模型发一句“回复 OK”（免费的优先，测一下不花钱），显示连得上（几秒）或报错原文。magpie 网关有没有开着，点一下就知道。
+- **安全**：只读角色用 pi 自己的只读方式：`--exclude-tools edit,write,bash`。可写角色要求工作目录是 git 仓库、工作区干净、同一仓库没有别的可写任务在跑；跑完附上 `git diff --stat`，由 Claude 审阅，不自动提交。
+- **隔离用户自己装的东西**：外派出去的模型只该碰工作目录。pi 默认会加载 `~/.pi/agent` 下的扩展、MCP 和技能。作者机器上只读任务也拿得到 `subagent`、`act_ui`（操控桌面）、`launch_browser`、`web_search` 和知识库 MCP（含能写入的 `add_to_inbox`）。所以每次都加 `--no-mcp --no-extensions --no-skills --no-prompt-templates`，只把 `pi.keepExtensions` 里的扩展（默认只拦危险命令的 `cc-safety-net`）用 `-e` 加回来。项目和全局的 AGENTS.md 照常读。
+- **数据**：免费模型的提供方可能保存内容或拿来改进模型，插件不按名单区分。不想把某个项目的内容发给免费模型时，在「外派模型」页把这些模型设成“不用”，或把 `pi.freeModels` 对应的提供商关掉。magpie 的地址和 key 只在 pi 自己的配置里，插件不读也不存。
+- **超时能杀干净**：Windows 上 npm 装的 `pi` 是 `.cmd` 外壳。经 `cmd /d /c` 起的话，超时只杀掉 cmd，真正干活的 node 成了孤儿，管道不关，任务一直挂着。所以先 `where pi.cmd`，从外壳里读出真正的程序（`.js` 交给外壳旁的 node.exe）直接起（`launcher` / `parseShim`）；读不出来才退回 `cmd /d /c`。每个会话开始时重新找一次。
+- Windows 上每次调 pi 前从注册表读一遍用户级环境变量，Claude 启动后才设置的 key 也能用上。
 
 ### 旧配置迁移
 
-0.2.x 的配置文件没有 `opencode` 段。读到这样的文件时（`migrateOpencode`）：
+读到没有 `pi.freeModels` 的配置文件（0.4 及以前）时（`needsMigrate` / `migrateFree`）：
 
-1. 加上 `opencode` 提供商（免费）、opencode 模型的档位（只加用户没写过的键）、`pi.strengths` 和 `opencode` 段；
-2. 如果角色和兜底还是 0.2 的默认值，按新档位重排（`buildRoles`）；用户手调过的不动，提示里请用户自己点「按档位重排」；
-3. 先把原文件存成 `auto-router.json.bak`，再写回新配置，弹一条提示。
+1. 模型名改写：`opencode/<x>` 换成 `magpie/opencode-zen-free/<x>`，0.3–0.4 里 opencode 自配提供商的 `oc:…` 模型去掉；角色链、兜底、`pi.tiers`、`pi.strengths` 一起改，**顺序不动**。一个角色的模型全被去掉时用默认角色的模型；
+2. 去掉 `opencode` 提供商、`oc:…` 提供商和顶层 `opencode` 段；没有 `magpie` 的加上（按量付费，免费的靠 `freeModels`）；加上 `pi.freeModels` 默认值；
+3. 0.2.x 的配置（本来就没有免费模型）补上免费模型的档位；角色和兜底还是 0.2 的默认值时按新档位重排（`buildRoles`），手调过的不动；
+4. 先把原文件存成 `auto-router.json.bak`，再写回新配置，弹一条提示。写回后带了 `freeModels`，下次不再迁移。例外：还开着的 0.4 会话读配置时会补上自己的默认值（opencode 提供商、`opencode/…` 的档位和擅长）再存回去，所以文件里有 `freeModels` 但又出现旧条目时（`needsMigrate` 里的 `hasLegacy`），再按第 1、2 步清一次（`migrateFree(cfg, repair=true)`）：新旧写法都在的以新写法为准，`freeModels` 和已有的 `.bak` 不动。
 
 ## 3. 省额度
 
@@ -193,7 +173,7 @@ sequenceDiagram
 | `in` / `cw` / `cr` / `out` / `usd` | 输入、缓存写、缓存读、输出 token，这一轮的花费 |
 | `ctx` / `wk` | 本轮开始时的上下文 token 数、7 天额度百分比 |
 | `sid` / `ex` / `ra` / `sv` | 会话、实验、切换组、省额度组 |
-| `cv` | 配置版本，如 `0.3.1-5f3a9c`：插件版本加上 `claude`、`saver`、`experiment` 三段配置的哈希（`configVersion`）。每条现算，会话中途改了配置，后面的记录就带新版本 |
+| `cv` | 配置版本，如 `0.4.0-5f3a9c`：Claude 这边做法的版本（`LOGIC_VERSION`，只在切换、分类、省额度的逻辑变了时才改，不跟插件版本走；0.3.x 的记录写的是当时的插件版本）加上 `claude`、`saver`、`experiment` 三段配置的哈希（`configVersion`）。每条现算，会话中途改了配置，后面的记录就带新版本 |
 
 **换数据目录**：`dataDir` 改了以后，每次会话开始时 `moveLogs` 把默认目录里的日志搬过去：同名文件按行合并去重、按时间排序，读回核对每一行都在了才删旧文件（`$.fs` 没有删除，走 `del` / `rm`）。还开着的旧版本会话之后又写到旧目录的，下次会话开始再搬一次。
 

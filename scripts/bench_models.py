@@ -1,4 +1,4 @@
-"""opencode 免费模型实测：每个模型跑同一组固定任务，按标准答案或测试自动打分（只用标准库）。
+"""外派模型实测（经 pi 跑，默认测 magpie 网关里的免费模型）：每个模型跑同一组固定任务，按标准答案或测试自动打分（只用标准库）。
 
 任务（每项 0–1 分，按能拉开差距的难度设计）：
   summary  总结一段有干扰信息的中文通知：要点覆盖、不写进被否决的方案、不超过 3 句
@@ -8,8 +8,9 @@
   vision   看一张 3×3 色块图，答出中间和四角的颜色（只给看图模型跑，--vision-all 全跑）
 
 用法：
-  python bench_models.py [--models opencode/a,opencode/b] [--tasks summary,review] [--out 结果.json] [--jobs 3] [--timeout 300] [--vision-all]
-不给 --models 时取 `opencode models opencode` 列出的全部免费模型。
+  python bench_models.py [--models magpie/opencode-zen-free/a,agnes/b] [--tasks summary,review] [--out 结果.json] [--jobs 3] [--timeout 300] [--vision-all]
+不给 --models 时取 `pi --list-models` 里 magpie/opencode-zen-free/ 下的全部免费模型。
+和 auto-router 派活时一样隔离：不加载扩展、MCP、技能、提示模板和 AGENTS.md，只读任务去掉 edit、write、bash。
 结果文件里有任务输出原文，默认写到当前目录的 bench-results.json（已在 .gitignore 里），不要提交。
 """
 import argparse
@@ -29,66 +30,58 @@ IS_WIN = os.name == "nt"
 VISION_HINT = ("-vl", "vision", "vl-")
 
 
-def opencode_exe():
-    """Windows 上从 npm 的 opencode.cmd 外壳里读出 opencode.exe 直接起：经 cmd /c 起的话超时只杀得掉 cmd，进程会挂着"""
+FREE_PREFIX = "magpie/opencode-zen-free/"
+ISOLATION = ["--no-mcp", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files"]
+
+
+def pi_exe():
+    """Windows 上从 npm 的 pi.cmd 外壳里读出 cli.js 交给 node 直接起：经 cmd /c 起的话超时只杀得掉 cmd，进程会挂着"""
     if not IS_WIN:
-        return ["opencode"]
-    shim = shutil.which("opencode.cmd")
+        return ["pi"]
+    shim = shutil.which("pi.cmd")
     if shim:
         with open(shim, encoding="utf-8", errors="replace") as f:
-            m = re.findall(r'"%dp0%\\([^"%]+\.exe)"', f.read())
-        exe = os.path.join(os.path.dirname(shim), m[-1]) if m else ""
-        if exe and os.path.exists(exe):
-            return [exe]
-    return ["cmd", "/d", "/c", "opencode"]
+            m = re.findall(r'"%dp0%\\([^"%]+\.js)"', f.read())
+        js = os.path.join(os.path.dirname(shim), m[-1]) if m else ""
+        if js and os.path.exists(js):
+            node = os.path.join(os.path.dirname(shim), "node.exe")
+            return [node if os.path.exists(node) else "node", js]
+    return ["cmd", "/d", "/c", "pi"]
 
 
-OC = opencode_exe()
+PI = pi_exe()
 
 
-def opencode(args, stdin, timeout, cwd=None, env=None):
-    """跑 opencode run，返回 (退出码, 最终文字, 错误, 秒数)。
-
-    按 opencode 2.x 写：--standalone 起私有服务（常驻服务收不到注入的代理），没有 --dir，目录靠 cwd
-    """
-    cmd = OC + args
+def pi(model, stdin, timeout, read_only=True, cwd=None, extra=()):
+    """跑一次 pi -p，返回 (退出码, 最终文字, 错误, 秒数)"""
+    cmd = PI + ["-p", "--no-session", "--model", model, *ISOLATION]
+    if read_only:
+        cmd += ["--exclude-tools", "edit,write,bash"]
+    cmd += list(extra)
     t0 = time.time()
     try:
         r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=timeout, cwd=cwd, env=env)
+                           timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired:
         return -1, "", "timeout", time.time() - t0
-    text, err = parse_events(r.stdout)
-    if r.returncode != 0 and not err:
+    err = ""
+    if r.returncode != 0:
         err = (r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1][:200]
-    return r.returncode, text, err, time.time() - t0
-
-
-def parse_events(stdout):
-    """--format json 的事件流：取最后一步的文字，没有就取全部文字；error 事件的消息"""
-    steps, err = [[]], ""
-    for line in stdout.splitlines():
-        line = line.lstrip("\ufeff").strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("type") == "step_start":
-            steps.append([])
-        elif e.get("type") == "text":
-            steps[-1].append(e.get("part", {}).get("text", ""))
-        elif e.get("type") == "error":
-            d = e.get("error", {})
-            err = (d.get("data") or {}).get("message") or d.get("name") or "error"
-    last = "\n".join(t for t in steps[-1] if t.strip())
-    return (last or "\n".join(t for s in steps for t in s if t.strip())).strip(), err
+    return r.returncode, r.stdout.strip(), err, time.time() - t0
 
 
 def ro(model, prompt, a, extra=()):
-    """只读代理跑一次"""
-    return opencode(["run", "-m", model, "--format", "json", "--agent", a.ro_agent, "--standalone", *extra], prompt, a.timeout, env=a.env)
+    """只读跑一次"""
+    return pi(model, prompt, a.timeout, extra=extra)
+
+
+def free_models():
+    """pi --list-models 里 magpie/opencode-zen-free/ 下的模型（第一列提供商、第二列模型）"""
+    out = subprocess.run(PI + ["--list-models"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=120).stdout
+    rows = (line.split() for line in out.splitlines())
+    names = [f"{r[0]}/{r[1]}" for r in rows if len(r) >= 2]
+    return [m for m in names if m.startswith(FREE_PREFIX)]
 
 
 # ---------- 任务 ----------
@@ -162,8 +155,7 @@ def task_bugfix(model, a):
             subprocess.run(["git", *g], cwd=d, capture_output=True)
         prompt = ("test_duration.py 里的测试没通过。修好 duration.py，让它完全符合函数说明（说明里提到的情况都要对，"
                   "不只是现有测试）。不要改 test_duration.py。改完运行 `python -m unittest test_duration` 检查，最后说明改了什么。")
-        code, text, err, secs = opencode(["run", "-m", model, "--format", "json", "--agent", a.rw_agent, "--standalone"],
-                                         prompt, a.timeout, cwd=d, env=a.env)
+        code, text, err, secs = pi(model, prompt, a.timeout, read_only=False, cwd=d)
         with open(os.path.join(d, "test_duration.py"), encoding="utf-8") as f:
             if f.read() != BUG_TEST:
                 return 0.0, secs, err or "改了测试文件", text
@@ -288,7 +280,7 @@ def task_vision(model, a):
         prompt = ("The attached image is a 3x3 grid of colored squares. Answer with JSON only: "
                   '{"center": color, "top_left": color, "top_right": color, "bottom_left": color, "bottom_right": color}, '
                   "using one English color word each.")
-        code, text, err, secs = ro(model, prompt, a, ["-f", p, "--"])  # -f 直接附图，不经 read 工具
+        code, text, err, secs = ro(model, prompt, a, [f"@{p}"])  # @文件 直接附图，不经 read 工具
         m = re.search(r"\{.*\}", text, re.S)
         try:
             got = {k: str(v).lower() for k, v in json.loads(m.group(0)).items()} if m else {}
@@ -313,6 +305,8 @@ def run_model(model, a):
             score, secs, err, text = TASKS[name](model, a)
         except Exception as ex:  # noqa: BLE001 单个任务出错不影响别的
             score, secs, err, text = 0.0, 0.0, str(ex)[:200], ""
+        if err and not text.strip():
+            score = 0.0  # 报错又没输出（如限流）不给分：extract 的 null 字段会白得分
         out[name] = {"score": score, "secs": round(secs, 1), "error": err, "output": text[:2000]}
         print(f"{model:42} {name:8} {score:4.2f} {secs:6.1f}s {err[:60]}", flush=True)
     return model, out
@@ -320,7 +314,7 @@ def run_model(model, a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--models", help="逗号分隔的模型；默认取 opencode 的全部免费模型")
+    p.add_argument("--models", help="逗号分隔的 pi 模型；默认取 magpie/opencode-zen-free/ 下的全部免费模型")
     p.add_argument("--tasks", default=",".join(TASKS), help="逗号分隔的任务")
     p.add_argument("--out", default="bench-results.json")
     p.add_argument("--jobs", type=int, default=3, help="同时跑几个模型")
@@ -328,30 +322,9 @@ def main():
     p.add_argument("--vision-all", action="store_true", help="看图任务也给名字里不带 vl 的模型跑")
     a = p.parse_args()
     a.tasks = [t for t in a.tasks.split(",") if t in TASKS]
-    # 和 auto-router 派活时一样：不读用户全局的 opencode 配置（MCP、插件、全局 AGENTS.md）和 ~/.claude 下的技能；
-    # 权限先全部 deny 再放开读和搜索，可写的再放开 edit 和 bash（不继承用户的 "ask"，否则 opencode run 会卡住）
-    a.ro_agent, a.rw_agent = "bench-readonly", "bench-write"
-    base = {"*": "deny", "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"}, "grep": "allow", "glob": "allow", "list": "allow"}
-    agents = {
-        a.ro_agent: {"mode": "primary", "description": "bench read-only", "permission": base},
-        a.rw_agent: {"mode": "primary", "description": "bench write", "permission": {
-            **base, "edit": "allow", "todowrite": "allow",
-            "bash": {"*": "allow", **{p: "deny" for p in (
-                "git commit*", "git push*", "git reset*", "git clean*", "rm -r*", "rm -fr*",
-                "Remove-Item*-Recurse*", "rd /s*", "rmdir /s*", "del /s*", "Format-Volume*")}}}},
-    }
-    home = os.path.join(tempfile.gettempdir(), "bench-opencode-config")
-    os.makedirs(home, exist_ok=True)
-    a.env = {**os.environ, "XDG_CONFIG_HOME": home, "OPENCODE_DISABLE_CLAUDE_CODE": "1",
-             "OPENCODE_DISABLE_AUTOUPDATE": "1",
-             "OPENCODE_CONFIG_CONTENT": json.dumps({"agent": agents})}
-    if a.models:
-        models = [m.strip() for m in a.models.split(",") if m.strip()]
-    else:
-        # 顺带让隔离的配置目录先装好依赖（第一次要一会儿），免得第一个任务超时
-        listed = subprocess.run(OC + ["models", "--standalone"], capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", env=a.env, timeout=300).stdout.split()
-        models = [m for m in listed if m.startswith("opencode/")]
+    models = [m.strip() for m in a.models.split(",") if m.strip()] if a.models else free_models()
+    if not models:
+        sys.exit("没有要测的模型：pi --list-models 里没有 magpie/opencode-zen-free/ 下的模型（magpie 没开或连不上？）")
     results = {}
     with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
         for model, out in pool.map(lambda m: run_model(m, a), models):
@@ -371,4 +344,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
     main()

@@ -4,13 +4,13 @@
     "name": "chinbor"
   },
   "metadata": {
-    "description": "auto-router: save Claude plan quota — switch models only when the cache is cold, keep context small, optionally hand side tasks to pi / opencode"
+    "description": "auto-router: save Claude plan quota — switch models only when the cache is cold, keep context small, optionally hand side tasks to pi"
   },
   "plugins": [
     {
       "name": "auto-router",
       "source": "./",
-      "description": "Save Claude plan quota: pick Opus or Sonnet only when the prompt cache is cold, guard context-heavy reads, remind to hand off or compact, show where the cost goes, optionally dispatch tasks to pi or opencode, and measure it all with per-session A/B tests. Works out of the box; UI in Chinese"
+      "description": "Save Claude plan quota: pick Opus or Sonnet only when the prompt cache is cold, guard context-heavy reads, remind to hand off or compact, show where the cost goes, optionally dispatch tasks to pi (including free models via a magpie gateway), and measure it all with per-session A/B tests. Works out of the box; UI in Chinese"
     }
   ]
 }

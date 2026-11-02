@@ -3,11 +3,10 @@ import type { EngineInterface } from 'claude-code'
 
 import type { Config } from './config'
 import { configPath, validate } from './config'
-import { config, currentVersion, dataRoot, logDir, readLogs, reportDir, rt, sep } from './core'
+import { config, currentVersion, dataRoot, logDir, readLogs, refreshPiModels, reportDir, rt, sep } from './core'
 import { categoryStats, categoryText, costSplit, costSplitText, delegateStats, delegateText, experimentReport, redoStats, redoText, reportText, summarize } from './stats'
 
 const piModels = atom({ plugin: 'auto-router', key: 'piModels' } as const, [], { shape: 'models-1' })
-const ocModels = atom({ plugin: 'auto-router', key: 'ocModels' } as const, [], { shape: 'models-1' })
 const paused = atom({ plugin: 'auto-router', key: 'paused' } as const, {}, { shape: 'paused-1' })
 
 // 效果报告：/auto-router eval、router_config report、报告文件（<dataDir>/report/latest.md、latest.json）都从这里出。
@@ -246,9 +245,9 @@ export async function doctor($: EngineInterface): Promise<string> {
   )
 
   // 外派：模型清单、暂停中的、最近成功率
-  const pi = (await read($, piModels)).length
-  const oc = (await read($, ocModels)).length
-  out.push(pi || oc ? ok(`外派模型清单：pi ${pi} 个，opencode ${oc} 个`) : warn('还没读到外派模型清单：没装 pi / opencode，或还没在「外派模型」页点过刷新'))
+  // 重载后清单是空的（第一次派活或打开外派页才读）：自己读一次，免得把“还没读”报成“没装”
+  const pi = (await read($, piModels)).length || (await refreshPiModels($).catch(() => [])).length
+  out.push(pi ? ok(`外派模型清单：pi ${pi} 个`) : warn('读不到外派模型清单：没装 pi，或 pi --list-models 出错'))
   const stopped = Object.entries(await read($, paused)).filter(([, v]) => v.until > now)
   if (stopped.length) out.push(warn(`暂停中：${stopped.slice(0, 4).map(([k, v]) => `${k}（${v.reason}）`).join('、')}，到点自动恢复`))
   const jobs = logs.flatMap(r => (r.t === 'pi' ? [r] : []))

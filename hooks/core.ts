@@ -2,7 +2,7 @@ import { atom, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { ModelMode, ProbeResult, RouterDecision } from '../types'
-import { chainFor, channelOf, configPath, loadConfig, ocModelArg, onlyDetected, parseModelList, parseOpencodeModels, saveConfig, tagged, validate } from './config'
+import { chainFor, configPath, loadConfig, migrateModel, onlyDetected, parseModelList, saveConfig, validate } from './config'
 import type { Config } from './config'
 import { crossedLevel, quotaText, remindText } from './saver'
 import { configVersion, parseLog, sessionArms } from './stats'
@@ -13,7 +13,6 @@ import type { Arm, LogRecord, SessionTags } from './stats'
 // 同一 plugin/key 的 atom 在用到它的每个文件里各声明一份：引擎扫描要求 atom 写在读写它的文件里
 const configRev = atom({ plugin: 'auto-router', key: 'configRev' } as const, 0)
 const piModels = atom({ plugin: 'auto-router', key: 'piModels' } as const, [], { shape: 'models-1' })
-const ocModels = atom({ plugin: 'auto-router', key: 'ocModels' } as const, [], { shape: 'models-1' })
 
 // ---------- 状态 ----------
 
@@ -139,15 +138,9 @@ export async function reportDir($: EngineInterface): Promise<string> {
   return `${await dataRoot($)}${sep()}report`
 }
 
-let pluginVersion: Promise<string> | undefined
-
-/** 当前配置版本，写进每条日志；报告按它分组 */
+/** 当前配置版本，写进每条日志；报告按它分组（不含插件版本，见 LOGIC_VERSION） */
 export async function currentVersion($: EngineInterface, cfg?: Config): Promise<string> {
-  pluginVersion ??= $.fs
-    .read(`${$.plugin.root}${sep()}.claude-plugin${sep()}plugin.json`)
-    .then(t => String((JSON.parse(t) as { version?: string }).version ?? '?'))
-    .catch(() => '?')
-  return configVersion(cfg ?? (await config($)), await pluginVersion)
+  return configVersion(cfg ?? (await config($)))
 }
 
 /**
@@ -219,8 +212,16 @@ export async function readLogs($: EngineInterface, from: number): Promise<LogRec
   // 文件名是 日期_会话id前8位.jsonl（分段的带 -2、-3），旧记录没写 sid 的按文件名补
   return texts.flatMap((t, i) => {
     const sid = /_([^_]+?)(?:-\d+)?\.jsonl$/.exec(files[i]?.name ?? '')?.[1]
-    return parseLog(t).map(r => (r.sid || !sid ? r : { ...r, sid }))
+    return parseLog(t).map(r => upgradeRecord(r.sid || !sid ? r : { ...r, sid }))
   })
+}
+
+/** 0.5 之前的外派记录：模型名换成新写法（opencode/<x> → magpie/opencode-zen-free/<x>），按模型的统计和返工排序才接得上 */
+export function upgradeRecord(r: LogRecord): LogRecord {
+  if (r.t !== 'pi') return r
+  const model = migrateModel(r.model) ?? r.model
+  const redo = r.redo && (migrateModel(r.redo) ?? r.redo)
+  return model === r.model && redo === r.redo ? r : { ...r, model, redo }
 }
 
 export function armOf(mode: ModelMode, d: RouterDecision | null): Arm {
@@ -234,11 +235,10 @@ export function armOf(mode: ModelMode, d: RouterDecision | null): Arm {
 const launchers = new Map<string, Promise<string[]>>()
 
 /**
- * 外派命令的启动前缀。Windows 上 npm 装的 pi / opencode 是 .cmd 外壳：经 cmd /c 起的话，超时只杀得掉 cmd，
- * 真正干活的 node / opencode.exe 成了孤儿，管道不关，任务一直挂着（实测）。所以从外壳里读出真正的程序直接起，
+ * 外派命令的启动前缀。Windows 上 npm 装的 pi 是 .cmd 外壳：经 cmd /c 起的话，超时只杀得掉 cmd，
+ * 真正干活的 node 成了孤儿，管道不关，任务一直挂着（实测）。所以从外壳里读出真正的程序直接起，
  * 读不出来才退回 cmd /d /c。
- * 缓存的路径每次用前确认还在：opencode 会自己升级，实测 2.x 把安装位置从 opencode-ai 挪到了 @opencode/cli，
- * 旧路径一失效，任务就报“系统找不到指定的路径”
+ * 缓存的路径每次用前确认还在：升级可能换了安装位置，旧路径一失效，任务就报“系统找不到指定的路径”
  */
 export async function launcher($: EngineInterface, name: string): Promise<string[]> {
   if (!rt.isWindows) return [name]
@@ -317,201 +317,24 @@ export async function piArgv($: EngineInterface, model: string, readOnly: boolea
   return piCommand($, args)
 }
 
-// ---------- opencode ----------
-
-export async function opencodeCommand($: EngineInterface, args: string[]): Promise<string[]> {
-  return [...(await launcher($, 'opencode')), ...args]
-}
-
-/** 经 OPENCODE_CONFIG_CONTENT 临时注入的两个代理，不改用户的 opencode 配置 */
-export const OC_READONLY_AGENT = 'auto-router-readonly'
-export const OC_WRITE_AGENT = 'auto-router-write'
-
-const ocMajors = new Map<string, Promise<number>>()
-
-/** opencode 的大版本，按程序路径缓存（升级换了位置就重新查）；查不出按 2 */
-async function opencodeMajor($: EngineInterface): Promise<number> {
-  const argv = await launcher($, 'opencode')
-  const key = argv.join(' ')
-  let major = ocMajors.get(key)
-  if (!major) {
-    major = $.process
-      .run([...argv, '--version'], { timeoutMs: 30_000 })
-      .then(r => Number(/(\d+)\.\d+/.exec(r.stdout)?.[1] ?? 2))
-      .catch(() => 2)
-    ocMajors.set(key, major)
-  }
-  return major
-}
-
-/**
- * 2.x 起 opencode 默认连常驻的后台服务，我们注入的环境变量（隔离目录、两个代理）到不了它，
- * 实测报 Agent not found；所以加 --standalone 起私有服务。2.x 也去掉了 --dir，目录靠 cwd
- */
-export async function opencodeArgv($: EngineInterface, model: string, readOnly: boolean, dir: string): Promise<string[]> {
-  const agent = readOnly ? OC_READONLY_AGENT : OC_WRITE_AGENT
-  const m = ocModelArg(model)
-  if ((await opencodeMajor($)) < 2) return opencodeCommand($, ['run', '-m', m, '--format', 'json', '--dir', dir, '--agent', agent])
-  return opencodeCommand($, ['run', '-m', m, '--format', 'json', '--agent', agent, '--standalone'])
-}
-
-/** 隔离用的 opencode 配置目录：不读用户全局的 opencode.json（里面的 MCP、插件、全局 AGENTS.md） */
-export async function opencodeHome($: EngineInterface): Promise<string> {
-  return (await configPath($, rt.isWindows)).replace(/auto-router\.json$/, `auto-router${sep()}opencode`)
-}
-
-let ocProviderCache: Promise<Record<string, unknown>> | undefined
-
-/** 用户全局 opencode 配置（opencode.json / .jsonc / config.json）里的 provider 一段；读不到、解析不了返回 {} */
-export function userOcProviders($: EngineInterface): Promise<Record<string, unknown>> {
-  ocProviderCache ??= (async () => {
-    const env = await userEnv($)
-    const home = (await configPath($, rt.isWindows)).replace(/[\\/]\.claude[\\/]auto-router\.json$/, '')
-    const dir = `${env.XDG_CONFIG_HOME || `${home}${sep()}.config`}${sep()}opencode`
-    for (const name of ['opencode.json', 'opencode.jsonc', 'config.json']) {
-      const text = await $.fs.read(`${dir}${sep()}${name}`).catch(() => undefined)
-      if (!text) continue
-      try {
-        return (JSON.parse(stripJsonc(text)) as { provider?: Record<string, unknown> }).provider ?? {}
-      } catch {
-        continue
-      }
-    }
-    return {}
-  })()
-  return ocProviderCache
-}
-
-/** 去掉 JSONC 的整行注释、块注释和结尾多余的逗号（不碰字符串里的 //，如网址） */
-export function stripJsonc(text: string): string {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/^\s*\/\/.*$/gm, '')
-    .replace(/,(\s*[}\]])/g, '$1')
-}
-
-/** 外派给 opencode 时的环境变量：隔离目录，加上用户自己配的提供商 */
-export async function ocEnv($: EngineInterface): Promise<Record<string, string>> {
-  return opencodeEnv(await opencodeHome($), await userOcProviders($))
-}
-
-const OC_BASH_DENY = [
-  'git commit*',
-  'git push*',
-  'git reset*',
-  'git clean*',
-  'rm -r*',
-  'rm -fr*',
-  'Remove-Item*-Recurse*',
-  'rd /s*',
-  'rmdir /s*',
-  'del /s*',
-  'Format-Volume*',
-]
-
-const OC_READ = { '*': 'allow', '*.env': 'deny', '*.env.*': 'deny', '*.env.example': 'allow' }
-
-/**
- * opencode 的环境变量。实测：
- * - 自带的 plan 代理只禁 edit，bash 照样能写文件，所以只读用自己的代理；
- * - 用户全局配置里的 MCP（如知识库）、插件、全局 AGENTS.md 和 ~/.claude 下的技能都会带进来，
- *   所以把 XDG_CONFIG_HOME 指到插件自己的空目录、关掉 Claude Code 兼容，权限先全部 deny 再逐个放开；
- * - 用户配置里 bash 是 "ask" 时，opencode run 没人点允许会一直卡着，所以可写代理把 bash 明确设成 allow，
- *   只拦提交、推送和 reset（改动留给 Claude 审阅）
- */
-export function opencodeEnv(home: string, provider: Record<string, unknown> = {}): Record<string, string> {
-  const base = { '*': 'deny', read: OC_READ, grep: 'allow', glob: 'allow', list: 'allow' }
-  const agent = (description: string, permission: Record<string, unknown>) => ({ mode: 'primary', description, permission })
-  return {
-    XDG_CONFIG_HOME: home,
-    OPENCODE_DISABLE_CLAUDE_CODE: '1',
-    // 外派的任务里不自己升级：升级要下几百 MB，期间任务卡住，升级完旧路径也没了（实测）
-    OPENCODE_DISABLE_AUTOUPDATE: '1',
-    OPENCODE_CONFIG_CONTENT: JSON.stringify({
-      // 用户全局配置里自己加的提供商（如 magpie 这类中转）：隔离目录读不到，单独带上；只带 provider 一段，MCP、插件照旧不带
-      ...(Object.keys(provider).length ? { provider } : {}),
-      agent: {
-        [OC_READONLY_AGENT]: agent('auto-router read-only: read, grep, glob, list only', base),
-        [OC_WRITE_AGENT]: agent('auto-router write: edit and bash in the work dir, no commit or push', {
-          ...base,
-          edit: 'allow',
-          todowrite: 'allow',
-          // 后写的规则优先：先全部放开，再拦提交、推送、回退和递归删除（bash 能碰到工作目录外面）
-          bash: { '*': 'allow', ...Object.fromEntries(OC_BASH_DENY.map(p => [p, 'deny'])) },
-        }),
-      },
-    }),
-  }
-}
-
-/**
- * 解析 `opencode run --format json` 的事件流（一行一个 JSON）：
- * 结果取最后一步的文字（前面几步多是“我先看看某文件”），最后一步没字时取全部文字；error 事件的消息单独返回
- */
-export function parseOpencodeRun(stdout: string): { text: string; error?: string; freeLimit?: boolean; retryAfterMs?: number } {
-  const steps: string[][] = [[]]
-  let error: string | undefined
-  let freeLimit: boolean | undefined
-  let retryAfterMs: number | undefined
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.replace(/^﻿/, '').trim()
-    if (!line.startsWith('{')) continue
-    // 1.x：error.name + error.data.message；2.x：error.type + error.message + retryAfterMs
-    let ev: {
-      type?: string
-      part?: { text?: string }
-      error?: { name?: string; type?: string; message?: string; retryAfterMs?: number; data?: { message?: string } }
-    }
-    try {
-      ev = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (ev.type === 'step_start') steps.push([])
-    else if (ev.type === 'text' && ev.part?.text?.trim()) steps[steps.length - 1]?.push(ev.part.text)
-    else if (ev.type === 'error') {
-      error = ev.error?.data?.message ?? ev.error?.message ?? ev.error?.name ?? ev.error?.type ?? 'error'
-      // 免费额度按模型算（实测 glm 用完时 flint 照样能用），并告诉你多久后恢复
-      if (ev.error?.type === 'provider.free-limit') freeLimit = true
-      if (typeof ev.error?.retryAfterMs === 'number') retryAfterMs = ev.error.retryAfterMs
-    }
-  }
-  const last = steps[steps.length - 1] ?? []
-  const text = (last.length ? last : steps.flat()).join('\n\n').trim()
-  return freeLimit || retryAfterMs ? { text, error, freeLimit, retryAfterMs } : { text, error }
-}
-
 /**
  * 面板“测一下”：给模型派一句“回复 OK”的只读任务，看此刻能不能用。
- * 不进任务列表、不写日志（免得把检测算进效果统计），失败时带上报错原文和 opencode 报的恢复时间
+ * 不进任务列表、不写日志（免得把检测算进效果统计），失败时带上报错原文
  */
 export async function probeModel($: EngineInterface, cfg: Config, model: string): Promise<ProbeResult> {
   const t0 = Date.now()
-  const home = await opencodeHome($)
-  const isOc = channelOf(model) === 'opencode'
   try {
-    const argv = isOc ? await opencodeArgv($, model, true, home) : await piArgv($, model, true, cfg.pi.keepExtensions)
-    const env = { ...(await userEnv($)), ...(isOc ? await ocEnv($) : {}) }
-    const run = await $.process.run(argv, { cwd: home, env, stdin: 'Reply with the single word OK.', timeoutMs: 90_000 })
-    const parsed: ReturnType<typeof parseOpencodeRun> = isOc ? parseOpencodeRun(run.stdout) : { text: run.stdout.trim() }
+    const argv = await piArgv($, model, true, cfg.pi.keepExtensions)
+    const run = await $.process.run(argv, { cwd: await homeDir($), env: await userEnv($), stdin: 'Reply with the single word OK.', timeoutMs: 90_000 })
+    const text = run.stdout.trim()
     const done = { ms: Date.now() - t0, at: Date.now() }
-    if (run.exitCode === 0 && parsed.text && !parsed.error) return { ok: true, ...done }
-    const why = parsed.error ?? run.stderr.trim().split('\n').find(l => l.trim()) ?? `退出码 ${run.exitCode}`
-    return { ok: false, ...done, why: why.slice(0, 120), ...(parsed.retryAfterMs ? { retryAfterMs: parsed.retryAfterMs } : {}) }
+    if (run.exitCode === 0 && text) return { ok: true, ...done }
+    const why = run.stderr.trim().split('\n').find(l => l.trim()) ?? `退出码 ${run.exitCode}`
+    return { ok: false, ...done, why: why.slice(0, 120) }
   } catch (err) {
     const why = /still running/.test(String(err)) ? '90 秒没回应' : String(err).slice(0, 120)
     return { ok: false, ms: Date.now() - t0, at: Date.now(), why }
   }
-}
-
-/** opencode 里此刻还在的免费模型；空列表表示没取到（没装 opencode 或命令失败），这时不按下架处理 */
-export async function refreshOpencodeModels($: EngineInterface): Promise<string[]> {
-  // 列出全部提供商：opencode 自己的免费模型，加上你在 opencode 里配的其他家
-  const args = (await opencodeMajor($)) < 2 ? ['models'] : ['models', '--standalone']
-  const run = await $.process.run(await opencodeCommand($, args), { env: { ...(await userEnv($)), ...(await ocEnv($)) }, timeoutMs: 120_000 }).catch(() => undefined)
-  const list = run && run.exitCode === 0 ? parseOpencodeModels(run.stdout) : []
-  if (list.length) await update($, ocModels, () => list)
-  return list
 }
 
 // Windows 上 Claude 应用启动后才新设的用户环境变量（如 pi 的 $AGNES_PI_API_KEY）不会传给子进程，
@@ -547,18 +370,17 @@ export function describeTool(cfg: Config): string {
   const roles = Object.entries(cfg.pi.roles)
     .map(([name, role]) => [name, role, chainFor(cfg, name)] as const)
     .filter(([, , chain]) => chain.length > 0)
-    .map(([name, role, chain]) => `- ${name}${role.readOnly ? ' [read-only]' : ''}: ${role.description} (models: ${chain.map(tagged).join(' -> ')})`)
+    .map(([name, role, chain]) => `- ${name}${role.readOnly ? ' [read-only]' : ''}: ${role.description} (models: ${chain.join(' -> ')})`)
   const guard = cfg.pi.guard.requireCleanGit
     ? 'A job that may write files (any role not marked read-only) is refused unless its directory is a git repository with a clean working tree and no other writing job runs there; commit or stash first. ' +
       'Do not edit those files yourself while it runs. Its result lists the files the agent changed, uncommitted: review them with git diff and keep or revert each before going on. '
     : ''
   return (
-    'Hand a self-contained task to a headless coding agent on non-Claude models, which runs in a terminal with its own read/bash/edit/write tools in the given directory. ' +
-    'Each model names its channel: [pi] models run on the pi coding agent, [opencode] models (opencode/...) run on `opencode run` (free models; some log usage, so those are only used in directories the user allowed). ' +
+    'Hand a self-contained task to the pi coding agent on non-Claude models, which runs headless in a terminal with its own read/bash/edit/write tools in the given directory. ' +
     'Use it to offload work that can be fully specified and checked afterwards (bulk edits, large reading, independent side tasks, a second-opinion review) so the Claude session keeps its context; ' +
     'keep judgment, design and acceptance in Claude, and verify what comes back. The agent sees nothing of this conversation. ' +
-    'Pick the role that fits; each tries its models in order and skips providers that are off, in peak hours, or paused after an auth/quota error, and free models that were withdrawn or are not allowed for the directory; when none is left it uses the fallback models' +
-    (cfg.pi.fallback.length ? ` (${cfg.pi.fallback.map(tagged).join(' -> ')})` : '') +
+    'Pick the role that fits; each tries its models in order and skips providers that are off or in peak hours, models paused after an auth, quota, rate-limit or connection error, and models no longer listed by pi; when none is left it uses the fallback models' +
+    (cfg.pi.fallback.length ? ` (${cfg.pi.fallback.join(' -> ')})` : '') +
     ', and only if those are unusable too is the job queued until off-peak. ' +
     guard +
     'background=true returns a job id at once; fetch the output later with pi_result.\nRoles:\n' +
@@ -566,45 +388,44 @@ export function describeTool(cfg: Config): string {
   )
 }
 
-/** 本机有没有外派通道，跨会话记在 store 里：会话开始时先按上次的结果定要不要注册外派工具，后台再检测一遍 */
-type Channels = { pi: boolean; oc: boolean; at: number }
+/** 本机有没有 pi，跨会话记在 store 里：会话开始时先按上次的结果定要不要注册外派工具，后台再检测一遍 */
+type Channels = { pi: boolean; at: number }
 const CHANNELS = 'channels'
-/** 上次检测 pi 和 opencode 都没装 */
+/** 上次检测 pi 没装 */
 let noChannels = false
 
 export async function initChannels($: EngineInterface): Promise<void> {
   const known = (await $.store.get(CHANNELS).catch(() => undefined)) as Channels | undefined
-  noChannels = !!known && !known.pi && !known.oc
+  noChannels = !!known && !known.pi
 }
 
 /**
- * 后台检测本机的 pi、opencode：两边都列不出模型就算没装，外派工具改成“不可用”（引擎不能撤掉已注册的工具），下个会话起不注册。
+ * 后台检测本机的 pi：列不出模型就算没装，外派工具改成“不可用”（引擎不能撤掉已注册的工具），下个会话起不注册。
  * 装了的一天查一次；没装的每个会话都查（没装时命令立刻失败，不费事），装上后当场注册。
  * firstRun（配置文件刚生成）时只开着检测到的提供商，按档位重排角色
  */
 export async function detectChannels($: EngineInterface, firstRun: boolean): Promise<void> {
   const known = (await $.store.get(CHANNELS).catch(() => undefined)) as Channels | undefined
-  if (!firstRun && known && (known.pi || known.oc) && Date.now() - known.at < 86_400_000) return
-  const [pi, oc] = await Promise.all([refreshPiModels($), refreshOpencodeModels($)])
-  const found: Channels = { pi: pi.length > 0, oc: oc.length > 0, at: Date.now() }
+  if (!firstRun && known?.pi && Date.now() - known.at < 86_400_000) return
+  const pi = await refreshPiModels($)
+  const found: Channels = { pi: pi.length > 0, at: Date.now() }
   await $.store.set(CHANNELS, found).catch(() => undefined)
-  noChannels = !found.pi && !found.oc
+  noChannels = !found.pi
   if (firstRun && !noChannels) {
-    const errs = await editConfig($, cfg => onlyDetected(cfg, pi, found.oc))
+    const errs = await editConfig($, cfg => onlyDetected(cfg, pi))
     if (!errs.length) return
   }
   await registerTools($, await config($))
 }
 
-/** 外派工具此刻能不能用：装了 pi 或 opencode，且至少一个角色排得出模型 */
+/** 外派工具此刻能不能用：装了 pi，且至少一个角色排得出模型 */
 export function canDelegate(cfg: Config): boolean {
   return !noChannels && Object.keys(cfg.pi.roles).some(r => chainFor(cfg, r).length > 0)
 }
 
 const NO_DELEGATE =
-  'Not available: neither the pi coding agent nor opencode is installed on this machine, or no delegate model is set up. Do not call this tool; do the work yourself. ' +
-  'The user can install pi or opencode and pick models in /auto-router (the delegate models tab).'
-
+  'Not available: the pi coding agent is not installed on this machine, or no delegate model is set up. Do not call this tool; do the work yourself. ' +
+  'The user can install pi and pick models in /auto-router (the delegate models tab).'
 export async function registerTools($: EngineInterface, cfg: Config): Promise<void> {
   const usable = canDelegate(cfg)
   // 本会话还没注册过、又用不了：不注册，模型看不到它，系统提示里的规则也就不提外派
@@ -617,7 +438,7 @@ export async function registerTools($: EngineInterface, cfg: Config): Promise<vo
     await $.tool.register({
       name: 'pi_result',
       isDeferred: false,
-      description: 'Get the status and output of a job (pi or opencode) started by pi_dispatch with background=true, or one queued for off-peak hours.',
+      description: 'Get the status and output of a job started by pi_dispatch with background=true, or one queued for off-peak hours.',
       inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
     })
   await $.tool.register({
@@ -629,7 +450,7 @@ export async function registerTools($: EngineInterface, cfg: Config): Promise<vo
       properties: {
         task: { type: 'string', description: 'Complete instructions for the agent, including file paths and what done looks like.' },
         role: { type: 'string', enum: Object.keys(cfg.pi.roles), description: `Role, default ${cfg.pi.defaultRole}.` },
-        model: { type: 'string', description: 'Exact model id (provider/id), overriding role; opencode/... runs on opencode, anything else on pi.' },
+        model: { type: 'string', description: 'Exact model id (provider/id, as pi --list-models shows it), overriding role.' },
         cwd: { type: 'string', description: 'Working directory for the agent, default the session directory.' },
         readOnly: { type: 'boolean', description: 'Disable edit, write and bash; read-only roles always are. Skips the git checks.' },
         background: { type: 'boolean', description: 'Return immediately with a job id.' },
@@ -651,5 +472,4 @@ export function resetSession(cwd: string) {
   reminded.clear()
   quotaWarned = false
   launchers.clear()
-  ocMajors.clear()
 }

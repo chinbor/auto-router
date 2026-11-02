@@ -500,7 +500,7 @@ test('/auto-router eval：带本会话分组和报告；只比当前配置版本
   const now = Date.now()
   const rows: string[] = []
   // 测试里读不到 plugin.json，插件版本记成 ?
-  const cv = configVersion(cfg, '?')
+  const cv = configVersion(cfg)
   for (const ver of [cv, undefined])
     for (let s = 0; s < 3; s++)
       for (const sv of ['on', 'off'])
@@ -523,7 +523,7 @@ test('/auto-router eval：带本会话分组和报告；只比当前配置版本
 test('配置版本：只随影响切换、省额度的配置变；dataDir 改了旧日志搬过去，核对后删旧文件', async ($, on) => {
   const base = configVersion(DEFAULT_CONFIG, '0.3.1')
   expect(base).toMatch(/^0\.3\.1-[0-9a-f]{6}$/)
-  expect(configVersion({ ...DEFAULT_CONFIG, pi: { ...DEFAULT_CONFIG.pi, timeoutMinutes: 1 } }, '0.3.1')).toBe(base)
+  expect(configVersion({ ...DEFAULT_CONFIG, pi: { ...DEFAULT_CONFIG.pi, timeoutMinutes: 1 } } as Config, '0.3.1')).toBe(base)
   expect(configVersion({ ...DEFAULT_CONFIG, claude: { ...DEFAULT_CONFIG.claude, downgradeAfter: 2 } }, '0.3.1')).not.toBe(base)
   expect(configVersion(DEFAULT_CONFIG, '0.3.2')).not.toBe(base)
 
@@ -542,7 +542,7 @@ test('配置版本：只随影响切换、省额度的配置变；dataDir 改了
   expect(out).toContain('效果报告：E:\\data\\report\\latest.md')
   expect(h.files['E:\\data\\report\\latest.md']).toMatch(/^# auto-router 效果报告[\s\S]*## 最近 7 天[\s\S]*## 最近的改动（CHANGELOG）/)
   const json = JSON.parse(h.files['E:\\data\\report\\latest.json'] as string) as { configVersion: string; week: { experiment: { versions: unknown[] } } }
-  expect(json.configVersion).toBe(configVersion({ ...DEFAULT_CONFIG, dataDir: 'E:\\data' }, '?'))
+  expect(json.configVersion).toBe(configVersion({ ...DEFAULT_CONFIG, dataDir: 'E:\\data' } as Config))
   expect(Array.isArray(json.week.experiment.versions)).toBe(true)
 })
 
@@ -868,7 +868,7 @@ async function toolsWith(on: On, $: Parameters<TestBody>[0], known: { pi: boolea
   return tools
 }
 
-test('上次检测 pi 和 opencode 都没装：不注册外派工具，系统提示里也就不提外派', async ($, on) => {
+test('上次检测 pi 没装：不注册外派工具，系统提示里也就不提外派', async ($, on) => {
   const tools = await toolsWith(on, $, { pi: false, oc: false })
   expect(tools).not.toContain('pi_dispatch')
   expect(tools).not.toContain('pi_result')
@@ -883,20 +883,20 @@ test('装了 pi：照常注册外派工具', async ($, on) => {
 
 test('第一次运行按检测结果改默认配置：只开检测到的提供商并重排角色；一个都排不出时只关提供商', () => {
   const cfg = DEFAULT_CONFIG
-  // 只装了 opencode
-  const oc = onlyDetected(cfg, [], true)
-  expect(oc.pi.providers.openai?.enabled).toBe(false)
-  expect(oc.pi.providers.opencode?.enabled).toBe(true)
-  const chains = Object.keys(oc.pi.roles).flatMap(r => chainFor(oc, r))
+  // pi 里只配了 magpie 网关：只用免费模型
+  const free = onlyDetected(cfg, ['magpie/opencode-zen-free/glm-5.3-flash-free', 'magpie/opencode-zen-free/mimo-v2.6-flash-free'])
+  expect(free.pi.providers.openai?.enabled).toBe(false)
+  expect(free.pi.providers.magpie?.enabled).toBe(true)
+  const chains = Object.keys(free.pi.roles).flatMap(r => chainFor(free, r))
   expect(chains.length).toBeGreaterThan(0)
-  expect(chains.every(m => m.startsWith('opencode/'))).toBe(true)
+  expect(chains.every(m => m.startsWith('magpie/opencode-zen-free/'))).toBe(true)
   // pi 里只有 openai 有 key
-  const gpt = onlyDetected(cfg, ['openai/gpt-6.1-sol', 'openai/gpt-6.1-terra'], false)
+  const gpt = onlyDetected(cfg, ['openai/gpt-6.1-sol', 'openai/gpt-6.1-terra'])
   expect(gpt.pi.providers.openai?.enabled).toBe(true)
   expect(gpt.pi.providers.agnes?.enabled).toBe(false)
   expect(Object.keys(gpt.pi.roles).flatMap(r => chainFor(gpt, r)).every(m => m.startsWith('openai/'))).toBe(true)
   // 只装了 pi、配的是没定档位的提供商：排不出角色，提供商全关，外派工具不注册
-  const none = onlyDetected(cfg, ['zhipu/glm-5'], false)
+  const none = onlyDetected(cfg, ['zhipu/glm-5'])
   expect(Object.keys(none.pi.roles).flatMap(r => chainFor(none, r))).toEqual([])
 })
 

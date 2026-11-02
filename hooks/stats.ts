@@ -60,7 +60,7 @@ export type SessionTags = {
   ra?: 'auto' | 'control'
   /** 省额度这一维：on 开，off 关 */
   sv?: 'on' | 'off'
-  /** 配置版本：插件版本 + 影响切换和省额度的配置的哈希，如 0.3.1-5f3a9c；0.3.1 之前的记录没有 */
+  /** 配置版本：Claude 这边做法的版本（LOGIC_VERSION）+ 影响切换和省额度的配置的哈希，如 0.4.0-5f3a9c；0.3.1 之前的记录没有 */
   cv?: string
 }
 
@@ -72,8 +72,6 @@ export type PiRecord = {
   ts: number
   role: string
   model: string
-  /** 走哪个通道；0.3 之前的记录没有，用 channelOfRecord 按模型前缀推断 */
-  ch?: 'pi' | 'opencode'
   ok: boolean
   ms: number
   ro?: boolean
@@ -84,11 +82,6 @@ export type PiRecord = {
 } & SessionTags
 
 export type LogRecord = TurnRecord | PiRecord | GuardRecord
-
-/** 外派记录的通道：旧记录没有 ch，opencode/ 开头的模型算 opencode，其余算 pi */
-export function channelOfRecord(r: Pick<PiRecord, 'ch' | 'model'>): 'pi' | 'opencode' {
-  return r.ch ?? (r.model.startsWith('opencode/') || r.model.startsWith('oc:') ? 'opencode' : 'pi')
-}
 
 export function parseLog(text: string): LogRecord[] {
   const out: LogRecord[] = []
@@ -176,7 +169,6 @@ export type Summary = {
     routed: number
     routedOk: number
     byModel: Record<string, number>
-    byChannel: Record<string, number>
     files: number
   }
   /** 窗口内 7 天额度百分比的最早、最晚读数 */
@@ -243,11 +235,8 @@ export function summarize(records: LogRecord[], from: number): Summary {
   }
 
   const piByModel: Record<string, number> = {}
-  const piByChannel: Record<string, number> = {}
   for (const p of pis) {
     piByModel[p.model] = (piByModel[p.model] ?? 0) + 1
-    const ch = channelOfRecord(p)
-    piByChannel[ch] = (piByChannel[ch] ?? 0) + 1
   }
   const wk = turns.filter(r => r.wk !== undefined)
   return {
@@ -262,7 +251,6 @@ export function summarize(records: LogRecord[], from: number): Summary {
       routed: pis.filter(p => p.role !== 'custom').length,
       routedOk: pis.filter(p => p.role !== 'custom' && p.ok).length,
       byModel: piByModel,
-      byChannel: piByChannel,
       files: pis.reduce((n, p) => n + (p.files ?? 0), 0),
     },
     // 期间额度窗口重置过（百分比往回掉）时 reset 为 true，面板就不写“从 x% 起”
@@ -289,12 +277,18 @@ function fnv(text: string): number {
 }
 
 /**
- * 配置版本：插件版本加上会改变切换、省额度做法的配置（claude 整段、saver 整段、experiment）的哈希。
+ * Claude 这边（模型切换、分类、省额度）做法的版本，写进配置版本。只在这部分逻辑变了时才改，不跟插件版本走：
+ * 只改外派、面板的升级（如 0.5.0）不该让对照实验从头攒样本。0.4.x 的记录写的就是 0.4.0，升级后接着比
+ */
+export const LOGIC_VERSION = '0.4.0'
+
+/**
+ * 配置版本：LOGIC_VERSION 加上会改变切换、省额度做法的配置（claude 整段、saver 整段、experiment）的哈希。
  * 不含外派模型顺序和界面设置：它们常改，又不影响 Claude 这边的花费，算进去会把样本切得太碎
  */
-export function configVersion(cfg: Pick<Config, 'claude' | 'saver' | 'experiment'>, pluginVersion: string): string {
+export function configVersion(cfg: Pick<Config, 'claude' | 'saver' | 'experiment'>, logicVersion = LOGIC_VERSION): string {
   const key = JSON.stringify([cfg.claude, cfg.saver, cfg.experiment])
-  return `${pluginVersion}-${fnv(key).toString(16).padStart(8, '0').slice(0, 6)}`
+  return `${logicVersion}-${fnv(key).toString(16).padStart(8, '0').slice(0, 6)}`
 }
 
 /** 会话 id 的 FNV-1a 哈希，第 0 位定模型切换组，第 1 位定省额度组：同一会话重载后分组不变 */

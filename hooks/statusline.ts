@@ -2,7 +2,7 @@
 // $.ui.status 只能放纯文字，所以用颜色圆点区分模型档位，用 emoji 区分类别和原因。纯函数，方便测试。
 
 import type { RouterDecision } from '../types'
-import { channelOf, rankOf } from './config'
+import { rankOf } from './config'
 
 const MODEL_DOT: Record<string, string> = { haiku: '🟢', sonnet: '🔵', opus: '🟣', fable: '🟡' }
 const MODEL_NAME: Record<string, string> = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus', fable: 'Fable' }
@@ -82,7 +82,7 @@ export function routeStatus(
   return parts.join(SEP)
 }
 
-/** 外派任务运行时的状态行：按通道显示，如「🚀 opencode · 文本 · glm-5.3-flash-free 运行中」 */
+/** 外派任务运行时的状态行，如「🚀 pi · 文本 · glm-5.3-flash-free 运行中」：模型只显示最后一段 */
 export function piStatus(role: string, model: string): string {
-  return [`🚀 ${channelOf(model)}`, ROLE_NAME[role] ?? role, `${model.split('/').slice(1).join('/') || model} 运行中`].join(SEP)
+  return ['🚀 pi', ROLE_NAME[role] ?? role, `${model.split('/').pop() || model} 运行中`].join(SEP)
 }

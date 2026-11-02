@@ -40,6 +40,7 @@ function base(on: On, opts: { write?: boolean; file?: Config } = {}) {
 function testConfig(roles: Config['pi']['roles'], fallback: string[] = []): Config {
   return {
     saver: DEFAULT_CONFIG.saver,
+    dataDir: DEFAULT_CONFIG.dataDir,
     experiment: 'off',
     // 类别引用的角色这里不一定有，去掉外派建议，免得校验不过退回默认配置
     claude: { ...DEFAULT_CONFIG.claude, categories: DEFAULT_CONFIG.claude.categories.map(({ piRole: _r, ...c }) => c) },
@@ -69,6 +70,8 @@ function fakeHost(
     // 找不到 .cmd 外壳：退回 cmd /d /c
     if (e.argv[0] === 'where') return { value: full({ exitCode: 1, stdout: '', stderr: '' }) }
     if (e.argv.includes('echo %USERPROFILE%')) return ok('C:\\Users\\me\r\n')
+    // 派活前取一次模型清单（看有没有下架的）：给个空清单，不按下架处理
+    if (e.argv.includes('--list-models')) return ok('')
     const model = e.argv[e.argv.indexOf('--model') + 1] ?? ''
     tried.push(model)
     return { value: full(pi(model, e.argv, e.init?.env)) }
@@ -91,16 +94,16 @@ test('deepseek 高峰时段：工作日 9-12、14-18 点（北京时间）', () 
 })
 
 test('模型链：高峰跳过 deepseek，关掉 openai 后跳过 gpt，默认不用 deepseek-v4-pro', () => {
-  expect(chainFor(DEFAULT_CONFIG, 'code', PEAK)).toEqual(['openai/gpt-6.1-terra', 'openai/gpt-6.1-sol', 'opencode/glm-5.3-flash-free'])
-  expect(chainFor(DEFAULT_CONFIG, 'longctx', PEAK)).toEqual(['opencode/deepseek-v4.1-flash-free', 'openai/gpt-6.1-terra'])
+  expect(chainFor(DEFAULT_CONFIG, 'code', PEAK)).toEqual(['openai/gpt-6.1-terra', 'openai/gpt-6.1-sol', 'magpie/opencode-zen-free/glm-5.3-flash-free'])
+  expect(chainFor(DEFAULT_CONFIG, 'longctx', PEAK)).toEqual(['magpie/opencode-zen-free/deepseek-v4.1-flash-free', 'openai/gpt-6.1-terra'])
 
   const noGpt: Config = {
     ...DEFAULT_CONFIG,
     pi: { ...DEFAULT_CONFIG.pi, providers: { ...DEFAULT_CONFIG.pi.providers, openai: { enabled: false, billing: 'subscription' } } },
   }
   // 免费的 glm 高峰也能接
-  expect(chainFor(noGpt, 'code', PEAK)).toEqual(['opencode/glm-5.3-flash-free'])
-  noGpt.pi.providers = { ...noGpt.pi.providers, opencode: { enabled: false, billing: 'free' } }
+  expect(chainFor(noGpt, 'code', PEAK)).toEqual(['magpie/opencode-zen-free/glm-5.3-flash-free'])
+  noGpt.pi.providers = { ...noGpt.pi.providers, magpie: { enabled: false, billing: 'token' } }
   expect(chainFor(noGpt, 'code')).toEqual(['cc-switch-deep-seek/deepseek-flash'])
   expect(chainFor(noGpt, 'code', PEAK)).toEqual([])
   expect(earliestRun(noGpt, chainFor(noGpt, 'code'), PEAK)).toBe(at('2026-10-29T04:00:00Z'))
@@ -114,15 +117,16 @@ test('兜底：gpt 退订 + deepseek 高峰时改用 agnes-3.0-flash；熔断的
     ...DEFAULT_CONFIG,
     pi: {
       ...DEFAULT_CONFIG.pi,
-      providers: { ...DEFAULT_CONFIG.pi.providers, openai: { enabled: false, billing: 'subscription' }, opencode: { enabled: false, billing: 'free' } },
+      providers: { ...DEFAULT_CONFIG.pi.providers, openai: { enabled: false, billing: 'subscription' }, magpie: { enabled: false, billing: 'token' } },
     },
   }
   expect(liveChain(noGpt, 'code', PEAK)).toEqual({ models: ['agnes/agnes-3.0-flash', 'agnes/agnes-2.5-flash'], isFallback: true })
   // 非高峰：deepseek-flash 正常接，不用兜底
   expect(liveChain(noGpt, 'code', at('2026-10-29T04:30:00Z'))).toEqual({ models: ['cc-switch-deep-seek/deepseek-flash'], isFallback: false })
   // gpt 还订着但被熔断：同样走兜底
-  expect(liveChain(DEFAULT_CONFIG, 'review', PEAK, p => p === 'openai').models).toEqual(['opencode/deepseek-v4.1-flash-free'])
-  expect(liveChain(DEFAULT_CONFIG, 'review', PEAK, p => p === 'openai' || p === 'opencode').isFallback).toBe(true)
+  expect(liveChain(DEFAULT_CONFIG, 'review', PEAK, p => p === 'openai').models).toEqual(['magpie/opencode-zen-free/deepseek-v4.1-flash-free'])
+  // 免费组熔断按上游组算：magpie/opencode-zen-free 停了，同一家别的组不受影响
+  expect(liveChain(DEFAULT_CONFIG, 'review', PEAK, p => p === 'openai' || p === 'magpie/opencode-zen-free').isFallback).toBe(true)
   // 兜底也被熔断：什么都不剩
   expect(liveChain(noGpt, 'code', PEAK, p => p === 'agnes').models).toEqual([])
 })
@@ -216,21 +220,22 @@ test('外派模型页（pi）：显示完整模型名，默认只列在用的；
     props: { title: 'auto-router', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   } as never)
   await ui.press({ key: 'tab-pi' })
-  // 按通道分组，每家下面直接列出检测到的全部模型，没选档位的也在
+  // 每家下面直接列出检测到的全部模型，没选档位的也在
   let hit
   for (let i = 0; i < 30 && !hit; i++) hit = await ui.find({ type: 'Text', text: /^[●○] gpt-6\.1-sol$/ })
   expect(hit).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^○ gpt-6\.1-mini$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /① pi 通道/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /② opencode 通道/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /① 提供商和模型/ })).toBeDefined()
+  // 只剩 pi 一个通道：不再分通道
+  expect(await ui.find({ type: 'Text', text: /opencode 通道/ })).toBeUndefined()
 
   // deepseek-flash 标成“不用”：各角色里的 deepseek 自动去掉
   written.length = 0
   await ui.press({ key: 'tier-cc-switch-deep-seek/deepseek-flash-none' })
   const roles = () => JSON.parse(written[written.length - 1] ?? '{}').pi?.roles
   for (let i = 0; i < 50 && !roles(); i++) await ui.findAll({})
-  expect(roles().code.models).toEqual(['openai/gpt-6.1-terra', 'openai/gpt-6.1-sol', 'opencode/glm-5.3-flash-free'])
-  expect(roles().longctx.models).toEqual(['opencode/deepseek-v4.1-flash-free', 'openai/gpt-6.1-terra'])
+  expect(roles().code.models).toEqual(['openai/gpt-6.1-terra', 'openai/gpt-6.1-sol', 'magpie/opencode-zen-free/glm-5.3-flash-free'])
+  expect(roles().longctx.models).toEqual(['magpie/opencode-zen-free/deepseek-v4.1-flash-free', 'openai/gpt-6.1-terra'])
   await ui.unmount()
 })
 
@@ -417,7 +422,7 @@ test('快速设置：格式整理链里，另一家的免费轻档排在订阅�
     },
   }
   const models = buildRoles(cfg).pi.roles.trivial?.models ?? []
-  expect(models.slice(0, 3)).toEqual(['opencode/nemotron-3.5-lightning-free', 'xfyun-spark/spark-x2.6', 'agnes/agnes-2.5-flash'])
+  expect(models.slice(0, 3)).toEqual(['magpie/opencode-zen-free/nemotron-3.5-lightning-free', 'xfyun-spark/spark-x2.6', 'agnes/agnes-2.5-flash'])
 })
 
 test('官方价：缓存写按 2 倍，Haiku 5.5 提示过 10 万换高一档', () => {
@@ -456,7 +461,7 @@ test('效果统计：按官方价算小模型少花多少，换模型重写缓�
   // 少花：Sonnet 0.006 − 0.004，Haiku 0.004 − 0.0001
   near(s.savedUsd, 0.0059)
   near(s.cheapUsd, 0.0041)
-  expect(s.pi).toEqual({ total: 1, ok: 1, routed: 1, routedOk: 1, byModel: { 'agnes/agnes-3.0-flash': 1 }, byChannel: { pi: 1 }, files: 0 })
+  expect(s.pi).toEqual({ total: 1, ok: 1, routed: 1, routedOk: 1, byModel: { 'agnes/agnes-3.0-flash': 1 }, files: 0 })
 })
 
 test('质量防护：说“不对，重做”时升一档，并把这轮记进效果日志', async ($, on) => {

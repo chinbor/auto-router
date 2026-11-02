@@ -2,15 +2,15 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { ModelMode, ModelRefresh, SettingsTab } from '../types'
-import { atLeast, buildRoles, CLAUDE_ALIASES, channelOf, claudeModelsFrom, isPeak, providerOf, say, setPath } from './config'
+import { atLeast, billingOf, buildRoles, CLAUDE_ALIASES, claudeModelsFrom, groupOf, isPeak, providerOf, say, setPath } from './config'
 import type { Billing, Config, Tier } from './config'
 import { costSplit, delegateStats, demotedModels, experimentReport, modelVersions, redoStats, summarize, verdict, versionLabel } from './stats'
 import { categoryIcon, modelTag } from './statusline'
 import type { Arm } from './stats'
-import { armLabel, clock, config, currentVersion, dataRoot, editConfig, logDir, reportDir, probeModel, readLogs, refreshOpencodeModels, refreshPiModels, rt, sessionTags } from './core'
+import { armLabel, clock, config, currentVersion, dataRoot, editConfig, logDir, reportDir, probeModel, readLogs, refreshPiModels, rt, sessionTags } from './core'
 import { weeklyPrompt } from './report'
 
-// /auto-router 设置面板：Claude 模型、外派模型（pi 和 opencode）、效果、任务四页。改动经 editConfig 校验后写回配置文件。
+// /auto-router 设置面板：Claude 模型、外派模型（pi）、效果、任务四页。改动经 editConfig 校验后写回配置文件。
 
 // 同一 plugin/key 的 atom 在用到它的每个文件里各声明一份：引擎扫描要求 atom 写在读写它的文件里
 const jobs = atom({ plugin: 'auto-router', key: 'jobs' } as const, [], { shape: 'jobs-2' })
@@ -21,7 +21,6 @@ const tab = atom({ plugin: 'auto-router', key: 'tab' } as const, 'claude' as Set
 const showMore = atom({ plugin: 'auto-router', key: 'showMore' } as const, false)
 const configRev = atom({ plugin: 'auto-router', key: 'configRev' } as const, 0)
 const piModels = atom({ plugin: 'auto-router', key: 'piModels' } as const, [], { shape: 'models-1' })
-const ocModels = atom({ plugin: 'auto-router', key: 'ocModels' } as const, [], { shape: 'models-1' })
 const paused = atom({ plugin: 'auto-router', key: 'paused' } as const, {}, { shape: 'paused-1' })
 const setupOpen = atom({ plugin: 'auto-router', key: 'setupOpen' } as const, null as string | null)
 const rebuildAsk = atom({ plugin: 'auto-router', key: 'rebuildAsk' } as const, false)
@@ -29,25 +28,24 @@ const probe = atom({ plugin: 'auto-router', key: 'probe' } as const, {}, { shape
 const refresh = atom({ plugin: 'auto-router', key: 'refresh' } as const, null as ModelRefresh | null, { shape: 'refresh-1' })
 /** 上次在面板里刷新时看到的模型清单，跨会话记在 store 里：新会话的清单是空的，只和本会话比会永远是“和上次一样” */
 const SEEN = 'seenModels'
-type Seen = { pi: string[]; oc: string[] }
+// 0.5 之前还记着 opencode 的清单（oc），读的时候不用
+type Seen = { pi: string[] }
 
 /**
- * 重新读 pi --list-models 和 opencode models，记下比上次刷新时多了、少了哪些。
- * 某条命令这次没取到（没装、失败）时，那边不算增减，也不覆盖上次的清单，免得把整家当成“都下架了”。
+ * 重新读 pi --list-models，记下比上次刷新时多了、少了哪些。
+ * 这次没取到（没装、失败）时不算增减，也不覆盖上次的清单，免得把整家当成“都下架了”。
  */
 async function refreshModels($: EngineInterface): Promise<void> {
   if ((await read($, refresh))?.running) return
   const seen = (await $.store.get(SEEN).catch(() => undefined)) as Seen | undefined
-  const [pi0, oc0] = [seen?.pi ?? (await read($, piModels)), seen?.oc ?? (await read($, ocModels))]
+  const pi0 = seen?.pi ?? (await read($, piModels))
   await update($, refresh, r => ({ at: r?.at ?? 0, added: r?.added ?? [], removed: r?.removed ?? [], running: true }))
-  const [pi1, oc1] = await Promise.all([refreshPiModels($), refreshOpencodeModels($)])
-  const diff = (before: string[], after: string[]) =>
-    !before.length || !after.length
-      ? { added: [], removed: [] }
-      : { added: after.filter(m => !before.includes(m)), removed: before.filter(m => !after.includes(m)) }
-  const [a, b] = [diff(pi0, pi1), diff(oc0, oc1)]
-  await $.store.set(SEEN, { pi: pi1.length ? pi1 : pi0, oc: oc1.length ? oc1 : oc0 } satisfies Seen).catch(() => undefined)
-  await update($, refresh, () => ({ at: Date.now(), added: [...a.added, ...b.added], removed: [...a.removed, ...b.removed] }))
+  const pi1 = await refreshPiModels($)
+  const both = pi0.length > 0 && pi1.length > 0
+  const added = both ? pi1.filter(m => !pi0.includes(m)) : []
+  const removed = both ? pi0.filter(m => !pi1.includes(m)) : []
+  await $.store.set(SEEN, { pi: pi1.length ? pi1 : pi0 } satisfies Seen).catch(() => undefined)
+  await update($, refresh, () => ({ at: Date.now(), added, removed }))
 }
 
 const statsDays = atom({ plugin: 'auto-router', key: 'statsDays' } as const, 7)
@@ -86,7 +84,7 @@ const PROVIDER_NAMES: Record<string, string> = {
   openai: 'OpenAI（GPT）',
   agnes: 'Agnes',
   'cc-switch-deep-seek': 'DeepSeek',
-  opencode: 'OpenCode 免费模型',
+  magpie: 'magpie（本地网关）',
 }
 
 type PaneEvent = Parameters<EngineInterface['ui']['resolve']>[0]
@@ -102,7 +100,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
 
   const edit = (fn: (c: Config) => Config) => () => {
     void editConfig($, fn).then(errs => {
-      if (errs.length) $.ui.toast(`没保存：${errs[0]}`)
+      if (errs.length) say($, `没保存：${errs[0]}`)
     })
   }
 
@@ -170,10 +168,11 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     </Box>
   )
   const roleName = (r: string) => ROLE_INFO[r]?.name ?? r
-  const providerName = (p: string) => PROVIDER_NAMES[p] ?? p.replace(/^oc:/, '')
+  const providerName = (p: string) => PROVIDER_NAMES[p] ?? p
   // 模型一律显示完整名称（去掉 provider/ 前缀）
   const modelName = (m: string) => m.split('/').slice(1).join('/') || m
-  const CH_COLOR = { pi: 'magenta', opencode: 'blue' } as const
+  // 任务页一行放不下上游组（opencode-zen-free/…），只显示最后一段，和状态行一致
+  const shortName = (m: string) => m.split('/').pop() || m
 
   const running = (await read($, jobs)).filter(j => j.status === 'running' || j.status === 'waiting').length
   const TABS: [SettingsTab, string][] = [
@@ -201,7 +200,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             onPress={async () => {
               await update($, tab, () => id)
               // 只在还没读过模型清单时读一次；之后要更新就点“刷新模型列表”
-              if (id === 'pi' && !(await read($, piModels)).length && !(await read($, ocModels)).length) await refreshModels($)
+              if (id === 'pi' && !(await read($, piModels)).length) await refreshModels($)
             }}
           />
         ))}
@@ -516,42 +515,36 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     )
   } else if (current === 'pi') {
     const known = await read($, piModels)
-    const ocKnown = await read($, ocModels)
     const expanded = await read($, setupOpen)
     const pausedMap = await read($, paused)
     const confirmRebuild = await read($, rebuildAsk)
     const probes = await read($, probe)
     const tiers = cfg.pi.tiers
     const isOn = (p: string) => cfg.pi.providers[p]?.enabled === true
-    const isOcProv = (p: string) => p === 'opencode' || p.startsWith('oc:')
-    // 每个通道的提供商：配置过的加上清单里列出的；opencode 自己的免费模型单独放第一家
+    // 提供商：配置过的加上 pi 清单里列出的
     const byName = (a: string, b: string) => a.localeCompare(b)
-    const piProvs = [...new Set([...Object.keys(cfg.pi.providers).filter(p => !isOcProv(p)), ...known.map(providerOf)])].sort(byName)
-    const ocProvs = [
-      'opencode',
-      ...[...new Set([...Object.keys(cfg.pi.providers).filter(p => p.startsWith('oc:')), ...ocKnown.map(providerOf)])].filter(p => p !== 'opencode').sort(byName),
-    ]
+    const piProvs = [...new Set([...Object.keys(cfg.pi.providers), ...known.map(providerOf)])].sort(byName)
     const flags = (expanded ?? '').split(',')
     const flag = (k: string) => flags.includes(k)
     const setFlag = (k: string) => void update($, setupOpen, () => (flag(k) ? flags.filter(f => f && f !== k) : [...flags.filter(Boolean), k]).join(',') || null)
-    const listedFor = (p: string) => (isOcProv(p) ? ocKnown : known).filter(m => providerOf(m) === p)
+    const listedFor = (p: string) => known.filter(m => providerOf(m) === p)
     const refreshed = await read($, refresh)
     // 刷新后新出现的模型，在清单里标“新”
     const isNew = (m: string) => (refreshed?.added ?? []).includes(m)
-    const gone = (m: string) => channelOf(m) === 'opencode' && ocKnown.length > 0 && !ocKnown.includes(m)
-    // pi 已经列出模型清单时，不在清单里的就是没装或没配 key
-    const missing = (m: string) => channelOf(m) === 'pi' && known.length > 0 && !known.includes(m)
-    // 额度用完的模型在派活顺序里只标 ⏸，什么时候恢复在 ③ 顶部合成一条写
-    const QUOTA = '额度用完'
+    const isFree = (m: string) => billingOf(cfg, m) === 'free'
+    // pi 已经列出模型清单时，不在清单里的：免费模型多半是下架了，其他的是没配 key；派活时一样跳过
+    const gone = (m: string) => known.length > 0 && !known.includes(m)
+    // 模型此刻被哪条暂停挡着：这个模型、它的上游组（如 magpie/opencode-zen-free）或整家（0.5 之前的旧记录）
+    const pausedBy = (m: string) => [m, groupOf(m), providerOf(m)].find(k => (pausedMap[k]?.until ?? 0) > now)
+    // 暂停的模型在派活顺序里只标 ⏸，什么时候恢复在 ② 顶部合成一条写
+    const PAUSED = '暂停中'
     // 此刻不用这个模型的原因；null 表示能用
     const whyNot = (m: string): string | null => {
       const p = cfg.pi.providers[providerOf(m)]
       if (p?.enabled === false) return '已关'
-      if (missing(m)) return '没检测到'
+      if (gone(m)) return isFree(m) ? '已下架' : '没检测到'
       if (isPeak(p?.peak, now)) return '高峰'
-      if ((pausedMap[providerOf(m)]?.until ?? 0) > now) return '暂停'
-      if ((pausedMap[m]?.until ?? 0) > now) return QUOTA
-      if (gone(m)) return '已下架'
+      if (pausedBy(m)) return PAUSED
       return null
     }
     // 改计费方式或档位后，按档位重排各角色的模型
@@ -600,36 +593,58 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
       const pause = pausedMap[p]
       const isPaused = (pause?.until ?? 0) > now
       const peakNow = prov?.peak && isPeak(prov.peak, now)
-      const [state, color] = !isUsed ? ['不用', 'gray'] : isPaused ? ['暂停', 'red'] : peakNow ? ['高峰', 'yellow'] : ['可用', 'green']
+      const [state, color] = !isUsed ? ['不用', 'gray'] : isPaused ? [PAUSED, 'red'] : peakNow ? ['高峰', 'yellow'] : ['可用', 'green']
       const total = listedFor(p).length
-      const picked = Object.keys(tiers).filter(m => providerOf(m) === p && !missing(m) && !gone(m)).length
+      const picked = Object.keys(tiers).filter(m => providerOf(m) === p && !gone(m)).length
+      // 本家下面被暂停的上游组（如 magpie/opencode-zen-free 限流或连不上）
+      const groups = Object.entries(pausedMap).filter(([k, v]) => k.startsWith(`${p}/`) && k.split('/').length === 2 && v.until > now)
+      // 测连通：给这家定了档位的模型发一句“回复 OK”，免费的优先（测一下不花钱）
+      const mine = Object.keys(tiers).filter(m => providerOf(m) === p && !gone(m))
+      const probeTarget = mine.find(isFree) ?? mine[0]
+      const conn = probeTarget ? probes[probeTarget] : undefined
+      const resume = (key: string) =>
+        void update($, paused, map => {
+          const { [key]: _gone, ...others } = map
+          return others
+        })
       // 名称 + 状态正好占模型行的“缩进 + 模型名”那么宽，付费方式和下面的档位下拉对齐
       return (
-        <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-          <Box width={NAME_W - 7} flexShrink={0}>
-            <Text bold>{providerName(p)}</Text>
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+            <Box width={NAME_W - 7} flexShrink={0}>
+              <Text bold>{providerName(p)}</Text>
+            </Box>
+            <Box width={6} flexShrink={0}>
+              {chip(state, color)}
+            </Box>
+            {fixed(SELECT_W, choice({ key: `bill-${p}`, value: isUsed ? prov?.billing : 'off', options: BILL_OPTS, onSelect: v => setProvider(p, v) }))}
+            <Text dimColor size="footnote">
+              {[total ? `用 ${picked} / ${total} 个` : picked ? `用 ${picked} 个` : '', isPaused ? `暂停到 ${clock(pause?.until ?? 0)}` : '']
+                .filter(Boolean)
+                .join(' · ')}
+            </Text>
+            {isPaused && <Button key={`resume-${p}`} label="恢复" onPress={() => resume(p)} />}
+            {isUsed &&
+              probeTarget &&
+              link(`conn-${p}`, conn?.running ? '连通测试中…' : '测连通', async () => {
+                await update($, probe, map => ({ ...map, [probeTarget]: { ok: false, ms: 0, at: 0, running: true } }))
+                const r = await probeModel($, cfg, probeTarget)
+                await update($, probe, map => ({ ...map, [probeTarget]: r }))
+              })}
+            {isUsed && conn && !conn.running && (
+              <Text color={conn.ok ? 'green' : 'red'} size="footnote">
+                {conn.ok ? `✓ 连得上（${Math.round(conn.ms / 100) / 10} 秒）` : `✗ ${(conn.why ?? '').slice(0, 40)}`}
+              </Text>
+            )}
           </Box>
-          <Box width={6} flexShrink={0}>
-            {chip(state, color)}
-          </Box>
-          {fixed(SELECT_W, choice({ key: `bill-${p}`, value: isUsed ? prov?.billing : 'off', options: BILL_OPTS, onSelect: v => setProvider(p, v) }))}
-          <Text dimColor size="footnote">
-            {[total ? `用 ${picked} / ${total} 个` : picked ? `用 ${picked} 个` : '', isPaused ? `暂停到 ${clock(pause?.until ?? 0)}` : '']
-              .filter(Boolean)
-              .join(' · ')}
-          </Text>
-          {isPaused && (
-            <Button
-              key={`resume-${p}`}
-              label="恢复"
-              onPress={() =>
-                void update($, paused, map => {
-                  const { [p]: _gone, ...others } = map
-                  return others
-                })
-              }
-            />
-          )}
+          {groups.map(([k, v]) => (
+            <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" paddingLeft={2}>
+              <Text color="red" size="footnote">
+                {`⏸ ${k.split('/')[1]} 这组暂停到 ${clock(v.until)}：${v.reason.slice(0, 60)}`}
+              </Text>
+              <Button key={`resume-${k}`} label="恢复" onPress={() => resume(k)} />
+            </Box>
+          ))}
         </Box>
       )
     }
@@ -643,6 +658,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
           </Text>
         </Box>
         {fixed(SELECT_W, choice({ key: `tier-${m}`, value: tiers[m] ?? 'none', options: TIER_OPTS, onSelect: v => setTier(m, v) }))}
+        {isFree(m) && cfg.pi.providers[providerOf(m)]?.billing !== 'free' && chip('免费', 'green')}
         {isNew(m) && chip('新', 'green')}
         {gone(m) && (
           <Text color="yellow" size="footnote">
@@ -655,7 +671,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     const FOLD_OVER = 12
     const providerBlock = (p: string) => {
       const listed = listedFor(p)
-      // 检测到了就列检测到的；没检测到任何（没装 pi / opencode）才列配置里的
+      // 检测到了就列检测到的；没检测到任何（没装 pi）才列配置里的
       const models = listed.length ? listed : Object.keys(tiers).filter(m => providerOf(m) === p)
       const ignored = listed.length ? Object.keys(tiers).filter(m => providerOf(m) === p && !listed.includes(m)).length : 0
       const open = flag(`all-${p}`)
@@ -681,9 +697,9 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
         </Box>
       )
     }
-    // 一个通道：启用的各家逐个列出；没启用的收成一行，点开再选付费方式
-    const channelBody = (key: string, provs: string[], keepShown: string[] = []) => {
-      const on = provs.filter(p => isOn(p) || keepShown.includes(p))
+    // 启用的各家逐个列出；没启用的收成一行，点开再选付费方式
+    const providerList = (key: string, provs: string[]) => {
+      const on = provs.filter(isOn)
       const off = provs.filter(p => !on.includes(p))
       const open = flag(`off-${key}`)
       return (
@@ -721,11 +737,10 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
         for (let m = queue.shift(); m; m = queue.shift()) {
           const r = await probeModel($, cfg, m)
           await update($, probe, map => ({ ...map, [m]: r }))
-          // 免费额度用完：按报的时间暂停这个模型；测通了就解除这个模型的暂停
-          if (r.retryAfterMs) await update($, paused, map => ({ ...map, [m]: { until: r.at + (r.retryAfterMs ?? 0), reason: r.why ?? '' } }))
-          else if (r.ok)
+          // 测通了就解除这个模型和它上游组的暂停
+          if (r.ok)
             await update($, paused, map => {
-              const { [m]: _done, ...rest } = map
+              const { [m]: _done, [groupOf(m)]: _group, ...rest } = map
               return rest
             })
         }
@@ -774,7 +789,12 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                 <Text color={why ? 'gray' : m === firstLive ? 'green' : undefined} bold={m === firstLive} dimColor={!!why}>
                   {modelName(m)}
                 </Text>
-                {why === QUOTA ? (
+                {isFree(m) && (
+                  <Text color="green" size="footnote">
+                    [免费]
+                  </Text>
+                )}
+                {why === PAUSED ? (
                   <Text color="yellow" size="footnote">
                     ⏸
                   </Text>
@@ -793,18 +813,18 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
       )
     }
     const roleRow = ([name, r]: [string, (typeof roles)[number][1]]) => chain(name, r.models, r.readOnly)
-    // 额度用完的模型按恢复时间分组：“08:04 恢复 glm-5.3-flash-free、nemotron-3.5-lightning-free”
-    const quotaOut = new Map<string, string[]>()
-    for (const m of toProbe.filter(m => (pausedMap[m]?.until ?? 0) > now).sort((a, b) => (pausedMap[a]?.until ?? 0) - (pausedMap[b]?.until ?? 0))) {
-      const at = clock(pausedMap[m]?.until ?? 0)
-      quotaOut.set(at, [...(quotaOut.get(at) ?? []), modelName(m)])
+    // 暂停的模型按暂停的那一条（模型或上游组）合成一行：“08:04 恢复 magpie/opencode-zen-free”
+    const pauseOut = new Map<string, number>()
+    for (const m of toProbe) {
+      const k = pausedBy(m)
+      if (k && k !== providerOf(m)) pauseOut.set(k, pausedMap[k]?.until ?? 0)
     }
     const auto = buildRoles(cfg).pi
     const drifted = JSON.stringify([auto.roles, auto.fallback]) !== JSON.stringify([cfg.pi.roles, cfg.pi.fallback])
 
     // 概览：在用几家、几个模型定了档位、几类活此刻有模型可派
-    const usedProvs = [...piProvs, ...ocProvs].filter(isOn).length
-    const tieredCount = Object.keys(tiers).filter(m => !missing(m) && !gone(m)).length
+    const usedProvs = piProvs.filter(isOn).length
+    const tieredCount = Object.keys(tiers).filter(m => !gone(m)).length
     const liveRoles = roles.filter(([, r]) => r.models.some(m => !whyNot(m))).length
     body = (
       <Box flexDirection="column">
@@ -820,12 +840,12 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
           <Text color={TIER_COLOR.light}>● 轻</Text>
           <Text dimColor>○ 不用</Text>
         </Box>
-        {intro('每家选付费方式，每个模型选档位，改完自动生效；③ 按“免费 › 订阅 › 按量”和档位自动排。')}
+        {intro('每家选付费方式，每个模型选档位，改完自动生效；② 按“免费 › 订阅 › 按量”和档位自动排。标 [免费] 的按 pi.freeModels 规则算免费。')}
         <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" marginBottom={1}>
           {link('refresh-models', refreshed?.running ? '⟳ 刷新中…' : '⟳ 刷新模型列表', () => void refreshModels($))}
           <Text dimColor size="footnote">
             {refreshed?.running
-              ? '正在重新读 pi 和 opencode 有哪些模型…'
+              ? '正在重新读 pi 有哪些模型…'
               : refreshed?.at
                 ? `${clock(refreshed.at)} 刷新：${
                     refreshed.added.length || refreshed.removed.length
@@ -841,7 +861,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
           </Text>
         </Box>
         {section(
-          '① pi 通道',
+          '① 提供商和模型',
           <Box flexDirection="column">
             {known.length === 0 && (
               <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" marginBottom={1}>
@@ -849,27 +869,13 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                 <Button key="detect" label="重新检测" onPress={() => void refreshPiModels($)} />
               </Box>
             )}
-            {channelBody('pi', piProvs)}
+            {providerList('pi', piProvs)}
           </Box>,
           'magenta',
-          '你自己配的各家模型',
+          'pi 里配的各家，免费模型也在这里（如 magpie 网关）',
         )}
         {section(
-          '② opencode 通道',
-          <Box flexDirection="column">
-            {ocKnown.length === 0 && cfg.pi.providers.opencode?.enabled !== false && (
-              <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" marginBottom={1}>
-                <Text color="yellow">没检测到 opencode 的模型（终端里 opencode models 要能列出来）</Text>
-                <Button key="detect-oc" label="重新检测" onPress={() => void refreshOpencodeModels($)} />
-              </Box>
-            )}
-            {channelBody('oc', ocProvs, ['opencode'])}
-          </Box>,
-          'blue',
-          '免费模型，和你在 opencode 里配的各家',
-        )}
-        {section(
-          '③ 派活顺序',
+          '② 派活顺序',
           <Box flexDirection="column">
             <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" marginBottom={1}>
               {link('probe', probing ? '⏱ 测试中…' : '⏱ 测一下能不能用', () => void runProbe())}
@@ -881,12 +887,12 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                     : `给每个模型发一句“回复 OK”，花费极小`}
               </Text>
             </Box>
-            {quotaOut.size > 0 && (
+            {pauseOut.size > 0 && (
               <Box flexDirection="column" marginBottom={1}>
-                <Text color="yellow">⏸ {[...quotaOut.values()].flat().length} 个模型免费额度用完，到点自动恢复：</Text>
-                {[...quotaOut].map(([at, ms]) => (
+                <Text color="yellow">⏸ 限流、额度用完或连不上，暂停中，到点自动恢复：</Text>
+                {[...pauseOut].map(([k, until]) => (
                   <Text dimColor size="footnote">
-                    {`   ${at} 恢复  ${ms.join('、')}`}
+                    {`   ${clock(until)} 恢复  ${k}`}
                   </Text>
                 ))}
               </Box>
@@ -894,7 +900,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             {roles.map(roleRow)}
             {cfg.pi.fallback.length > 0 && chain('都不行时', cfg.pi.fallback)}
             <Text dimColor size="footnote">
-              绿色 = 此刻会用；灰色 = 此刻跳过，黄字是原因，⏸ = 额度用完。
+              绿色 = 此刻会用；灰色 = 此刻跳过，黄字是原因，⏸ = 暂停中。
             </Text>
             {/* 你或 Claude 手调过顺序时，才给“恢复按档位排”的入口 */}
             {drifted && (
@@ -1168,7 +1174,6 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                 <Text>
                   {s.pi.total} 个任务（按角色派 {s.pi.routed} 个，指定模型 {s.pi.total - s.pi.routed} 个），改了 {s.pi.files} 个文件
                 </Text>
-                {Object.entries(s.pi.byChannel).map(([ch, n]) => chip(`${ch} ${n}`, CH_COLOR[ch as keyof typeof CH_COLOR] ?? 'gray'))}
               </Box>
               {/* 用得最多的模型，条形长短按任务数 */}
               {topModels.slice(0, 8).map(([m, n]) => (
@@ -1176,7 +1181,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                   <Box width={30} flexShrink={0}>
                     <Text>{modelName(m)}</Text>
                   </Box>
-                  <Text color={CH_COLOR[channelOf(m)]}>{'█'.repeat(Math.max(1, Math.round((n / topMax) * 16)))}</Text>
+                  <Text color="magenta">{'█'.repeat(Math.max(1, Math.round((n / topMax) * 16)))}</Text>
                   <Text dimColor tabular>
                     {n}
                   </Text>
@@ -1213,14 +1218,26 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     const readable = (t: string) =>
       (t.match(/\uFFFD/g)?.length ?? 0) >= 3 ? t.replace(/[^\x00-\x7F]*\uFFFD[^\x00-\x7F]*/g, '（Windows 中文报错，编码对不上看不清，多半是找不到程序或路径）') : t
     // 失败原因：免费额度用完、限流这类常见的直接说人话；其余取最后一条备注或输出末尾
-    const failReason = (job: (typeof list)[number]) => {
-      const all = [...job.notes, job.tail].join('\n')
-      if (/free usage limit|quota|额度/i.test(all)) return '免费额度用完'
+    const reasonOf = (all: string, last: string) => {
+      if (/free.?(usage.?)?limit/i.test(all)) return '免费额度用完（要十几个小时才恢复）'
+      if (/quota|insufficient|余额|额度/i.test(all)) return '额度用完或余额不足'
+      if (/econnrefused|econnreset|enotfound|fetch failed|failed to connect|connection (refused|reset|error)/i.test(all)) return '连不上（magpie 网关没开，或网络、代理有问题）'
       if (/\b429\b|rate.?limit/i.test(all)) return '被限流'
       if (/\b40[13]\b|unauthori[sz]ed|invalid api key/i.test(all)) return '鉴权失败（key 或订阅）'
-      const last = job.notes[job.notes.length - 1] ?? job.tail.trim().split('\n').pop() ?? ''
-      // “opencode/xxx: error” 这种只有一个 error 的，看不出原因，就说没给原因
+      if (/still running after|timed? ?out/i.test(all)) return '超时'
+      // “模型名: error” 这种只有一个 error 的，看不出原因，就说没给原因
       return /:\s*error$/i.test(last.trim()) ? '没给出原因（多半是免费额度用完或服务出错）' : readable(last).slice(0, 160)
+    }
+    const failReason = (job: (typeof list)[number]) =>
+      reasonOf([...job.notes, job.tail].join('\n'), job.notes[job.notes.length - 1] ?? job.tail.trim().split('\n').pop() ?? '')
+    // 完成了但中间换过模型：前面的模型为什么没用上（备注里“模型名: 报错”的行，跳过的不算）
+    const fellBack = (job: (typeof list)[number]) => {
+      const tried = job.notes.filter(n => /^\S+: /.test(n) && !/^\S+: 跳过（/.test(n) && !n.startsWith(`${job.model}: `))
+      const first = tried[0]
+      if (!first) return undefined
+      const model = first.slice(0, first.indexOf(': '))
+      const more = tried.length > 1 ? ` 等 ${tried.length} 个模型` : ''
+      return `先试的 ${shortName(model)}${more} 没成功：${reasonOf(first, first.slice(model.length + 2))}；换成 ${shortName(job.model)} 做完`
     }
     const flagOpen = await read($, setupOpen)
     const counts = list.reduce<Record<string, number>>((m, j) => ({ ...m, [j.status]: (m[j.status] ?? 0) + 1 }), {})
@@ -1251,10 +1268,9 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             ))}
         </Box>
         {list.length === 0 && <Text dimColor>还没有任务。</Text>}
-        {/* 一条一个框（边框颜色按状态），框里一行：状态、通道、角色、模型、用时、任务开头；失败的下面一行写原因，有改动的写待审 */}
+        {/* 一条一个框（边框颜色按状态），框里一行：状态、角色、模型、用时、任务开头；失败的下面一行写原因，有改动的写待审 */}
         {list.map(job => {
           const [label, color] = STATUS[job.status]
-          const ch = job.channel ?? channelOf(job.model)
           const when =
             job.status === 'waiting' ? `${clock(job.runAt ?? 0)} 开始` : `${Math.round(((job.endedAt ?? Date.now()) - job.startedAt) / 1000)} 秒`
           return (
@@ -1265,11 +1281,8 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                     {label}
                   </Text>
                 </Box>
-                <Box width={10} flexShrink={0}>
-                  <Text color={CH_COLOR[ch]}>{ch}</Text>
-                </Box>
                 <Box width={30} flexShrink={0}>
-                  <Text>{`${job.role === 'custom' ? '🎯' : (ROLE_ICON[job.role] ?? '▫')} ${modelName(job.model)}`}</Text>
+                  <Text wrap="truncate">{`${job.role === 'custom' ? '🎯' : (ROLE_ICON[job.role] ?? '▫')} ${shortName(job.model)}`}</Text>
                 </Box>
                 <Box width={8} flexShrink={0}>
                   <Text dimColor tabular>
@@ -1284,6 +1297,13 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
                 <Box paddingLeft={11}>
                   <Text color="red" size="footnote">
                     ↳ {failReason(job)}
+                  </Text>
+                </Box>
+              )}
+              {job.status === 'done' && fellBack(job) && (
+                <Box paddingLeft={11}>
+                  <Text color="yellow" size="footnote">
+                    ↳ {fellBack(job)}
                   </Text>
                 </Box>
               )}

@@ -4,14 +4,19 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { ColdMark, ModelMode, PiJob, RouterDecision, SettingsTab } from '../types'
 import {
   chainFor,
-  channelOf,
   configPath,
   consumeCreated,
   DEFAULT_CONFIG,
+  downFor,
   earliestRun,
+  groupOf,
+  pauseMinutesFor,
+  pauseText,
+  FREE_LIMIT,
   isPeak,
   liveChain,
-  migrateOpencode,
+  migrateFree,
+  needsMigrate,
   providerOf,
   say,
   setPath,
@@ -36,12 +41,8 @@ import {
   logDir,
   logRecord,
   moveLogs,
-  opencodeArgv,
-  ocEnv,
-  parseOpencodeRun,
   piArgv,
   readLogs,
-  refreshOpencodeModels,
   refreshPiModels,
   registerTools,
   initChannels,
@@ -59,7 +60,7 @@ import {
 // auto-router 的入口：把各模块接到引擎事件上。
 // 1. 模型切换：每次提交问题时分类（classify.ts），按类别把本轮主对话的 Claude 模型换成 haiku / sonnet / opus；
 //    升档立即生效，降档要连续几轮都判为更轻才降（换模型会让提示词缓存失效）
-// 2. 外派：注册 pi_dispatch 工具，Claude 按角色把任务派给 pi 或 opencode 在终端跑（opencode/ 开头的模型走 opencode）；分类判断适合外派时，给 Claude 附一句建议
+// 2. 外派：注册 pi_dispatch 工具，Claude 按角色把任务派给 pi 在终端跑；分类判断适合外派时，给 Claude 附一句建议
 // 3. 省额度（saver.ts）：拦大读取、上下文过大时提醒交接、把省额度规则写进系统提示，scout / executor 子代理在 agents/
 // 4. 对照实验：按会话 id 把新会话分到「切换 / 不切换」×「省额度 开 / 关」，/auto-router eval 出报告（stats.ts）
 // 共用的运行时状态、日志、配置读写在 core.ts，atom 在 state.ts，设置面板在 panel.tsx。
@@ -74,7 +75,6 @@ const lastDecision = atom({ plugin: 'auto-router', key: 'last' } as const, null,
 const coldMark = atom({ plugin: 'auto-router', key: 'cold' } as const, {} as ColdMark, { shape: 'cold-1' })
 const tab = atom({ plugin: 'auto-router', key: 'tab' } as const, 'claude' as SettingsTab)
 const piModels = atom({ plugin: 'auto-router', key: 'piModels' } as const, [], { shape: 'models-1' })
-const ocModels = atom({ plugin: 'auto-router', key: 'ocModels' } as const, [], { shape: 'models-1' })
 const paused = atom({ plugin: 'auto-router', key: 'paused' } as const, {}, { shape: 'paused-1' })
 const PANE = 'auto-router'
 
@@ -124,63 +124,51 @@ function noteJob(job: PiJob, task: string) {
 
 type DispatchInput = { task: string; role?: string; model?: string; cwd?: string; readOnly?: boolean }
 
-// 订阅失效、没 key、额度用完、限流：这类错误换个时间重试也没用，先把整家提供商暂停（opencode 免费额度用完例外：只停那个模型，见 runChain）
+// 订阅失效、没 key、额度用完、限流：这类错误换个时间重试也没用，先把这个上游组暂停（见 groupOf）
 const AUTH_ERROR =
-  /(no|missing|invalid|incorrect) api key|api key (is )?(missing|invalid|not set)|unauthori[sz]ed|\b401\b|\b403\b|forbidden|subscription (has )?(expired|ended|inactive|required)|quota|insufficient (balance|credit|funds|quota)|billing|payment required|\b402\b|\b429\b|rate.?limit|usage.?limit|too many requests|(token|credential|session)s? (has )?expired|not_ready|not logged in|please log ?in/i
+  /(no|missing|invalid|incorrect) api key|api key (is )?(missing|invalid|not set)|unauthori[sz]ed|\b401\b|\b403\b|forbidden|subscription (has )?(expired|ended|inactive|required)|quota|insufficient (balance|credit|funds|quota)|billing|payment required|\b402\b|\b429\b|rate.?limit|usage.?limit|too many requests|free.?limit|(token|credential|session)s? (has )?expired|not_ready|not logged in|please log ?in/i
+/** 连不上网关或上游（如本地的 magpie 没开）：同样暂停，换链上的下一个 */
+const CONN_ERROR = /econnrefused|econnreset|enotfound|getaddrinfo|fetch failed|socket hang up|connection (refused|reset|error)|failed to connect|network error/i
 /** $.process.run 超时的报错 */
 const TIMEOUT = /still running after \d+ms|timed? ?out/i
 
-/**
- * 拿来判断熔断的文字：只看报错。opencode 的 stdout 里有工具输出，只看 stderr 和 error 事件；
- * pi 的报错在 stderr，失败时 stdout 很短才算进去（长的是模型的回答）
- */
-function errorText(channel: string, run: { exitCode: number; stdout: string; stderr: string }, error: string | undefined): string {
-  if (channel === 'opencode') return `${run.stderr}\n${error ?? ''}`
+/** 拿来判断熔断的文字：只看报错。pi 的报错在 stderr，失败时 stdout 很短才算进去（长的是模型的回答） */
+function errorText(run: { exitCode: number; stdout: string; stderr: string }): string {
   return run.exitCode !== 0 && run.stdout.length < 400 ? `${run.stderr}\n${run.stdout}` : run.stderr
 }
 
-/** 任务走的通道：旧记录没写 channel，按模型前缀推断 */
-const chOf = (job: PiJob) => job.channel ?? channelOf(job.model)
-let ocChecked = false
-
 /**
- * 下架检查：返回 skip 判断和被跳过的原因。
- * opencode 的模型列表本会话还没取过、链上又有 opencode 模型时，先取一次；取不到就不按下架处理。
+ * 下架检查：pi --list-models 里没有了的模型（如免费模型下架）跳过，返回 skip 判断和原因。
+ * 本会话还没取过清单时先取一次；取不到（pi 没装或命令失败）就不按下架处理
  */
-async function opencodeSkips(
+let listChecked = false
+async function goneSkips(
   $: EngineInterface,
-  models: string[],
 ): Promise<{ skip: (m: string) => boolean; why: (m: string) => string | undefined }> {
-  let live = await read($, ocModels)
-  if (!live.length && !ocChecked && models.some(m => channelOf(m) === 'opencode')) {
-    ocChecked = true
-    live = await refreshOpencodeModels($)
+  let live = await read($, piModels)
+  if (!live.length && !listChecked) {
+    listChecked = true
+    live = await refreshPiModels($)
   }
-  const why = (m: string) => {
-    if (channelOf(m) !== 'opencode') return undefined
-    if (live.length && !live.includes(m)) return 'opencode 里已经没有这个模型（免费模型下架了）'
-    return undefined
-  }
+  const why = (m: string) => (live.length && !live.includes(m) ? 'pi --list-models 里已经没有这个模型（可能下架了）' : undefined)
   return { skip: m => why(m) !== undefined, why }
 }
 
-// 暂停表的键是提供商（整家暂停）或完整模型名（只停这一个，如 opencode 某个免费模型额度用完）
+// 暂停表的键是上游组（magpie/opencode-zen-free 这类三段模型名的前两段，两段的就是提供商）或完整模型名；
+// 0.5 之前按整家暂停的旧记录照样认
 async function pausedCheck($: EngineInterface): Promise<(key: string) => boolean> {
   const now = Date.now()
   const map = await read($, paused)
   return key => (map[key]?.until ?? 0) > now
 }
 
-async function pauseProvider($: EngineInterface, cfg: Config, key: string, reason: string, ms?: number) {
-  if (cfg.pi.pauseMinutes <= 0) return
-  const until = Date.now() + (ms ?? cfg.pi.pauseMinutes * 60_000)
+/** key 是上游组、整家，或免费额度用完时的单个模型；reason 是写进暂停表、面板上显示的一行；err 是完整报错，用来判断是连不上还是免费额度用完 */
+async function pauseGroup($: EngineInterface, cfg: Config, key: string, reason: string, err = reason) {
+  const minutes = pauseMinutesFor(err, cfg.pi.pauseMinutes)
+  if (minutes <= 0) return
+  const until = Date.now() + minutes * 60_000
   await update($, paused, map => ({ ...map, [key]: { until, reason } }))
-  say(
-    $,
-    key.includes('/')
-      ? `${key} 免费额度用完，暂停到 ${clock(until)}，其他模型照常用。`
-      : `${key} 报鉴权/额度错误，暂停到 ${clock(until)}。如果已经退订，到 /auto-router 提供商页关掉它。`,
-  )
+  say($, pauseText(key, err, CONN_ERROR.test(err), clock(until)))
 }
 
 async function saveJob($: EngineInterface, job: PiJob) {
@@ -194,7 +182,6 @@ async function saveJob($: EngineInterface, job: PiJob) {
       ts: Date.now(),
       role: job.role,
       model: job.model,
-      ch: chOf(job),
       ok: job.status === 'done',
       ms: (job.endedAt ?? Date.now()) - job.startedAt,
       ro: job.readOnly,
@@ -249,8 +236,7 @@ async function runJob($: EngineInterface, job: PiJob, input: DispatchInput): Pro
   const cwd = resolveCwd(input.cwd)
   let chain = [input.model ?? '']
   let fallback: string[] = []
-  const listed = input.model ? chain : [...(cfg.pi.roles[job.role]?.models ?? []), ...cfg.pi.fallback]
-  const oc = await opencodeSkips($, listed)
+  const oc = await goneSkips($)
   // 因下架被跳过的模型记一笔，Claude 和面板都看得到；兜底里的只在真用到兜底时记
   const noteSkips = (models: string[]) => {
     for (const m of [...new Set(models)]) {
@@ -260,7 +246,7 @@ async function runJob($: EngineInterface, job: PiJob, input: DispatchInput): Pro
   }
   noteSkips(input.model ? chain : (cfg.pi.roles[job.role]?.models ?? []))
   if (input.model) {
-    // 点名的模型下架了：不去调（下架的模型 opencode 只回一句 Unexpected server error）
+    // 点名的模型下架了：不去调
     if (oc.skip(input.model)) chain = []
   } else {
     const isDown = await pausedCheck($)
@@ -304,12 +290,12 @@ async function runChain(
   root: string | undefined,
 ): Promise<PiJob> {
   const startModel = chain[0] ?? job.model
-  job = { ...job, status: 'running', startedAt: Date.now(), model: startModel, channel: channelOf(startModel) }
+  job = { ...job, status: 'running', startedAt: Date.now(), model: startModel }
   await saveJob($, job)
   $.ui.status(piStatus(job.role, job.model))
 
   const env = await userEnv($)
-  // 刚超时过的提供商：同一条链里后面同一家的不再试，免得每个都等满超时
+  // 刚超时过的上游组：同一条链里后面同一组的不再试，免得每个都等满超时
   const timedOut = new Set<string>()
   const models = [...chain, ...fallback.models]
   for (const [i, model] of models.entries()) {
@@ -317,38 +303,27 @@ async function runChain(
       fallback.enter()
       notes.push(`${job.role} 的模型都没成功，接着试兜底 ${fallback.models.join(' → ')}`)
     }
-    const provider = providerOf(model)
-    // 同一条链里前面的模型刚把这家熔断了，后面同一家的就别再试
+    const group = groupOf(model)
+    // 同一条链里前面的模型刚把这组熔断了，后面同一组的就别再试
     const isDown = await pausedCheck($)
-    if (!input.model && (isDown(provider) || isDown(model))) {
-      notes.push(`${model}: 跳过（${isDown(provider) ? provider : model} 已暂停）`)
+    if (!input.model && downFor(isDown, model)) {
+      const key = [providerOf(model), group, model].find(k => isDown(k))
+      notes.push(`${model}: 跳过（${key} 已暂停）`)
       continue
     }
-    if (timedOut.has(provider)) {
-      notes.push(`${model}: 跳过（${provider} 刚超时）`)
+    if (timedOut.has(group)) {
+      notes.push(`${model}: 跳过（${group} 刚超时）`)
       continue
     }
-    const channel = channelOf(model)
-    job = { ...job, model, channel, notes: [...notes] }
+    job = { ...job, model, notes: [...notes] }
     await saveJob($, job)
     $.ui.status(piStatus(job.role, model))
     try {
       const readOnly = input.readOnly === true
       const timeoutMs = Math.min(cfg.pi.timeoutMinutes, 10) * 60_000
-      const run =
-        channel === 'opencode'
-          ? await $.process.run(await opencodeArgv($, model, readOnly, resolveCwd(input.cwd)), {
-              // 2.x 没有 --dir，工作目录只靠 cwd
-              cwd: resolveCwd(input.cwd),
-              env: { ...env, ...(await ocEnv($)) },
-              stdin: input.task,
-              timeoutMs,
-            })
-          : await $.process.run(await piArgv($, model, readOnly, cfg.pi.keepExtensions), { cwd: input.cwd, env, stdin: input.task, timeoutMs })
-      // opencode 输出的是 JSON 事件流：取最后的文字；出错时 stdout 里有 error 事件
-      const parsed: ReturnType<typeof parseOpencodeRun> = channel === 'opencode' ? parseOpencodeRun(run.stdout) : { text: run.stdout.trim() }
-      const out = parsed.text
-      if (run.exitCode === 0 && out && !parsed.error) {
+      const run = await $.process.run(await piArgv($, model, readOnly, cfg.pi.keepExtensions), { cwd: input.cwd, env, stdin: input.task, timeoutMs })
+      const out = run.stdout.trim()
+      if (run.exitCode === 0 && out) {
         outputs.set(job.id, out)
         const changes = root ? await gitChanges($, root) : undefined
         job = { ...job, status: 'done', endedAt: Date.now(), tail: out.slice(-1500), changes }
@@ -356,16 +331,18 @@ async function runChain(
         $.ui.status(undefined)
         return job
       }
-      const why = (parsed.error ?? run.stderr.trim().split('\n').find(l => l.trim()) ?? `exit ${run.exitCode}`).slice(0, 160)
+      const why = (run.stderr.trim().split('\n').find(l => l.trim()) ?? `exit ${run.exitCode}`).slice(0, 160)
       notes.push(`${model}: ${why}`)
-      // 只看报错，不看模型的回答：任务本身是“修限流”这类时，回答里出现 rate limit 不该熔断整家
-      // opencode 免费额度按模型算：只停这一个，按它报的恢复时间；其余照常熔断整家
-      if (parsed.freeLimit) await pauseProvider($, cfg, model, why, parsed.retryAfterMs)
-      else if (AUTH_ERROR.test(errorText(channel, run, parsed.error))) await pauseProvider($, cfg, provider, why)
+      // 只看报错，不看模型的回答：任务本身是“修限流”这类时，回答里出现 rate limit 不该熔断
+      const err = errorText(run)
+      // 免费额度按模型算（实测 glm 用完时别的免费模型照样能用）：只停这一个；限流、鉴权、连不上停整组
+      if (FREE_LIMIT.test(err)) await pauseGroup($, cfg, model, why, err)
+      else if (AUTH_ERROR.test(err) || CONN_ERROR.test(err)) await pauseGroup($, cfg, group, why, err)
     } catch (err) {
       const why = String(err)
       notes.push(`${model}: ${why.slice(0, 160)}`)
-      if (TIMEOUT.test(why)) timedOut.add(provider)
+      if (TIMEOUT.test(why)) timedOut.add(group)
+      else if (CONN_ERROR.test(why)) await pauseGroup($, cfg, group, why.slice(0, 160))
     }
     // 可写任务失败时已经改了文件：不再换模型，免得下一个在改了一半的代码上接着改
     if (root && i < models.length - 1 && (await gitChanges($, root))) {
@@ -384,7 +361,7 @@ async function runChain(
 }
 
 function report(job: PiJob): string {
-  const tag = `[${chOf(job)} ${job.id}]`
+  const tag = `[pi ${job.id}]`
   if (job.status === 'waiting') return `${tag} 排队中：能接这个任务的模型都在高峰时段，${clock(job.runAt ?? 0)}（北京时间）开始跑。`
   if (job.status === 'running') return `${tag} 仍在运行（${job.model}）`
   const secs = job.endedAt ? Math.round((job.endedAt - job.startedAt) / 1000) : 0
@@ -412,7 +389,7 @@ async function startJob(
   // all：不看时段时能用的（角色链 + 兜底，去掉关掉的）；usable：此刻能用的
   const enabled = (m: string) => cfg.pi.providers[providerOf(m)]?.enabled !== false
   const all = input.model ? [input.model] : [...chainFor(cfg, role), ...cfg.pi.fallback.filter(enabled)]
-  const oc = await opencodeSkips($, all)
+  const oc = await goneSkips($)
   const usable = input.model
     ? all.filter(m => !isPeak(cfg.pi.providers[providerOf(m)]?.peak, now))
     : liveChain(cfg, role, now, await pausedCheck($), oc.skip, await demoted($)).models
@@ -421,7 +398,6 @@ async function startJob(
     id: `p${(++seq).toString(36)}${now.toString(36).slice(-3)}`,
     role,
     model: first,
-    channel: channelOf(first),
     title: input.task.replace(/\s+/g, ' ').slice(0, 120),
     status: 'running',
     startedAt: now,
@@ -430,9 +406,9 @@ async function startJob(
     readOnly: input.readOnly,
   }
   noteJob(job, input.task)
-  const finish =(p: Promise<PiJob>) =>
+  const finish = (p: Promise<PiJob>) =>
     p.then(done => {
-      $.ui.toast(`${chOf(done)} ${done.id} ${done.status === 'done' ? '完成' : '失败'}（${done.model}）`)
+      say($, `pi ${done.id} ${done.status === 'done' ? '完成' : '失败'}（${done.model}）`)
       return done
     })
 
@@ -474,22 +450,16 @@ async function configTool($: EngineInterface, input: ConfigInput): Promise<strin
     }
     if (errs.length) return `没改，校验不通过：\n- ${errs.join('\n- ')}`
     const known = (await read($, piModels)) ?? []
-    const knownOc = (await read($, ocModels)) ?? []
     const used = [...new Set(Object.values((await config($)).pi.roles).flatMap(r => r.models))]
-    const unknown = known.length ? used.filter(m => channelOf(m) === 'pi' && !known.includes(m)) : []
-    const gone = knownOc.length ? used.filter(m => channelOf(m) === 'opencode' && !knownOc.includes(m)) : []
-    const warn =
-      (unknown.length ? `\n注意：pi --list-models 里没有 ${unknown.join(', ')}（可能没配 key）。` : '') +
-      (gone.length ? `\n注意：opencode models 里没有 ${gone.join(', ')}（免费模型可能下架了，派活时会跳过）。` : '')
+    const unknown = known.length ? used.filter(m => !known.includes(m)) : []
+    const warn = unknown.length ? `\n注意：pi --list-models 里没有 ${unknown.join(', ')}（可能没配 key 或已下架，派活时会跳过）。` : ''
     return `已保存 ${input.path}，下一个问题起生效。${warn}`
   }
   const cfg = await config($)
   const models = (await read($, piModels))?.length ? await read($, piModels) : await refreshPiModels($)
-  const oc = (await read($, ocModels))?.length ? await read($, ocModels) : await refreshOpencodeModels($)
   return [
     `配置文件：${path}`,
-    `[pi] 能用的模型：${models.join(', ') || '（没取到）'}`,
-    `[opencode] 此刻还在的免费模型：${oc.join(', ') || '（没取到）'}`,
+    `pi 能用的模型：${models.join(', ') || '（没取到）'}`,
     '```json',
     JSON.stringify(cfg, null, 2),
     '```',
@@ -528,10 +498,10 @@ export const register: Register = on => {
     lastMainArm = undefined
     hintRole = undefined
     dispatched = 0
-    ocChecked = false
+    listChecked = false
     await $.command.register({
       name: 'auto-router',
-      description: '模型路由、外派（pi / opencode）与省额度：打开设置面板；pi 配外派模型、stats 看效果、eval 出对照实验报告、run 派任务、weekly 设每周报告、doctor 自检、export / import 分享配置',
+      description: '模型路由、外派（pi）与省额度：打开设置面板；pi 配外派模型、stats 看效果、eval 出对照实验报告、run 派任务、weekly 设每周报告、doctor 自检、export / import 分享配置',
       argumentHint: '[pi | stats | eval [天数] | jobs | run [角色] <任务> | weekly [周报目录] | doctor | export [文件] | import <文件> | path]',
     })
     await initChannels($)
@@ -542,15 +512,15 @@ export const register: Register = on => {
     const firstRun = consumeCreated()
     if (firstRun) {
       rt.firstRun = true
-      say($, 'auto-router 已装好：换模型和省额度已经在工作。装了 pi 或 opencode 的，运行 /auto-router 在「外派模型」页确认一下外派用哪些模型')
+      say($, 'auto-router 已装好：换模型和省额度已经在工作。装了 pi 的，运行 /auto-router 在「外派模型」页确认一下外派用哪些模型')
     }
-    // 等会话起来几秒再检测，不拖慢启动（opencode models 要好几秒）
+    // 等会话起来几秒再检测，不拖慢启动
     void $.clock.after(5_000, () => void detectChannels($, firstRun).catch(() => undefined))
     await $.tool.register({
       name: 'router_config',
       isDeferred: true,
       description:
-        "Read or change the auto-router config (which Claude model each kind of prompt gets, which delegate models each role tries in order — [pi] models and [opencode] free models —, providers on/off, peak hours, holidays).Use it when the user asks to change routing in words. " +
+        "Read or change the auto-router config (which Claude model each kind of prompt gets, which pi delegate models each role tries in order, which models count as free, providers on/off, peak hours, holidays).Use it when the user asks to change routing in words. " +
         "action=get returns the config JSON and the pi models available; action=set changes one value by a dotted path (e.g. path 'pi.roles.code.models', value ['openai/gpt-6.1-sol','openai/gpt-6.1-terra']; path 'pi.providers.openai.enabled', value false; path 'pi.providers.cc-switch-deep-seek.peak.holidays', value [...dates]); remove=true deletes the key; action=reset restores defaults with a .bak backup; action=report (optional days, default 7) returns the effect report: experiment arms, per-category turns/corrections/cost, pi jobs and guard counts; action=probe tries each way of classifying a prompt (classify, complete, fork) and reports which work and how long they take, for when routing seems stuck. " +
         'Every change is validated before it is saved; read first with get, and set whole arrays.',
       inputSchema: {
@@ -724,7 +694,7 @@ export const register: Register = on => {
     if ('refused' in started) return { result: `没派：${started.refused}` }
     const { job, done } = started
     if (job.status === 'waiting') return { result: `${report(job)} 用 pi_result 取结果（id=${job.id}）。` }
-    if (input.background || !done) return { result: `[${chOf(job)} ${job.id}] 已在后台启动（${job.model}）。用 pi_result 取结果（id=${job.id}）。` }
+    if (input.background || !done) return { result: `[pi ${job.id}] 已在后台启动（${job.model}）。用 pi_result 取结果（id=${job.id}）。` }
     return { result: report(await done) }
   }).catch(($, _e, next) => ({ deny: `pi_dispatch 出错：${next.error?.message ?? '未知'}` }))
 
@@ -779,8 +749,8 @@ export const register: Register = on => {
         // 数据目录是本机的路径，不跟着别人的配置走
         dataDir: (await config($)).dataDir,
       }
-      // 0.2.x 导出的配置没有 opencode 提供商，按读配置时一样迁移
-      const merged = raw.pi && !raw.pi.providers?.opencode ? migrateOpencode(plain).cfg : plain
+      // 0.5 之前导出的配置（没有 pi.freeModels），按读配置时一样迁移
+      const merged = needsMigrate(raw) ? migrateFree(plain, raw.pi?.freeModels !== undefined).cfg : plain
       const path = await configPath($, rt.isWindows)
       const old = await config($)
       const errs = await editConfig($, () => merged)
@@ -799,14 +769,13 @@ export const register: Register = on => {
       const { job } = started
       await update($, tab, () => 'jobs' as SettingsTab)
       void $.ui.open({ id: PANE, title: 'auto-router' })
-      return { text: job.status === 'waiting' ? report(job) : `已派给 ${chOf(job)}（${job.role} · ${job.model}），id=${job.id}，完成后会提示。` }
+      return { text: job.status === 'waiting' ? report(job) : `已派给 pi（${job.role} · ${job.model}），id=${job.id}，完成后会提示。` }
     }
     const start: SettingsTab = sub === 'jobs' ? 'jobs' : sub === 'stats' ? 'stats' : sub === 'setup' || sub === 'pi' || rt.firstRun ? 'pi' : 'claude'
     rt.firstRun = false
     await update($, tab, () => start)
     await $.ui.open({ id: PANE, title: 'auto-router' })
     void refreshPiModels($)
-    void refreshOpencodeModels($)
     return { text: '设置面板已打开。改动直接写回配置文件，下一个问题起生效；节假日、高峰时段这类可以直接跟 Claude 说。' }
   })
 
