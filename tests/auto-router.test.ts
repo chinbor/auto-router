@@ -612,3 +612,47 @@ test('刷新模型列表：Claude 页能选 pi 清单里的具体版本；外派
   expect(await until({ type: 'Button', key: 'tier-openai/gpt-7-preview-none' })).toBeDefined()
   await ui.unmount()
 })
+
+test('刷新模型列表跨会话比：新会话第一次打开外派页，就标出上次刷新以后新上的模型', async ($, on) => {
+  const written: string[] = []
+  const store: Record<string, unknown> = { seenModels: { pi: ['openai/gpt-6.1-sol'], oc: [] } }
+  on('store.get', (_, e) => ({ value: store[(e as { key: string }).key] }))
+  on('store.set', (_, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    store[key] = value
+    return { value: undefined }
+  })
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__auto-router__${e.name}` } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('clock.after', () => new Promise(() => {}))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('fs.exists', () => ({ value: written.length > 0 }))
+  on('fs.read', () => ({ value: written[written.length - 1] ?? '' }))
+  on('fs.write', (_, e) => {
+    written.push(String(e.text))
+    return { value: undefined }
+  })
+  on('fs.list', () => ({ value: [] }))
+  const rows = ['provider  model  context', 'openai  gpt-6.1-sol  272K', 'openai  gpt-7-preview  400K']
+  on('process.run', (_, e) => ok(e.argv.includes('--list-models') ? rows.join('\n') : 'C:\\Users\\me\r\n'))
+  await $.session.start({ cwd: 'D:\\work', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: 'auto-router',
+    component: 'Pane',
+    requestId: 'auto-router',
+    surface: 'mobile',
+    props: { title: 'auto-router', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  } as never)
+  const until = async (q: Parameters<typeof ui.find>[0]) => {
+    let hit
+    for (let i = 0; i < 50 && !hit; i++) hit = await ui.find(q)
+    return hit
+  }
+  await ui.press({ key: 'tab-pi' })
+  expect(await until({ type: 'Text', text: /多了 1 个/ })).toBeDefined()
+  expect((store.seenModels as { pi: string[] }).pi).toContain('openai/gpt-7-preview')
+  await ui.unmount()
+})

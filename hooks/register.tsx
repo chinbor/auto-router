@@ -12,7 +12,6 @@ import {
   isPeak,
   liveChain,
   migrateOpencode,
-  privacyBlock,
   providerOf,
   say,
   setPath,
@@ -38,8 +37,7 @@ import {
   logRecord,
   moveLogs,
   opencodeArgv,
-  opencodeEnv,
-  opencodeHome,
+  ocEnv,
   parseOpencodeRun,
   piArgv,
   readLogs,
@@ -146,14 +144,11 @@ const chOf = (job: PiJob) => job.channel ?? channelOf(job.model)
 let ocChecked = false
 
 /**
- * 隐私开关和下架检查：返回 skip 判断和被跳过的原因。
+ * 下架检查：返回 skip 判断和被跳过的原因。
  * opencode 的模型列表本会话还没取过、链上又有 opencode 模型时，先取一次；取不到就不按下架处理。
  */
 async function opencodeSkips(
   $: EngineInterface,
-  cfg: Config,
-  role: string,
-  cwd: string,
   models: string[],
 ): Promise<{ skip: (m: string) => boolean; why: (m: string) => string | undefined }> {
   let live = await read($, ocModels)
@@ -164,7 +159,7 @@ async function opencodeSkips(
   const why = (m: string) => {
     if (channelOf(m) !== 'opencode') return undefined
     if (live.length && !live.includes(m)) return 'opencode 里已经没有这个模型（免费模型下架了）'
-    return privacyBlock(cfg, m, role, cwd, rt.isWindows)
+    return undefined
   }
   return { skip: m => why(m) !== undefined, why }
 }
@@ -255,8 +250,8 @@ async function runJob($: EngineInterface, job: PiJob, input: DispatchInput): Pro
   let chain = [input.model ?? '']
   let fallback: string[] = []
   const listed = input.model ? chain : [...(cfg.pi.roles[job.role]?.models ?? []), ...cfg.pi.fallback]
-  const oc = await opencodeSkips($, cfg, job.role, cwd, listed)
-  // 因隐私开关、下架被跳过的模型记一笔，Claude 和面板都看得到；兜底里的只在真用到兜底时记
+  const oc = await opencodeSkips($, listed)
+  // 因下架被跳过的模型记一笔，Claude 和面板都看得到；兜底里的只在真用到兜底时记
   const noteSkips = (models: string[]) => {
     for (const m of [...new Set(models)]) {
       const why = oc.why(m)
@@ -265,7 +260,7 @@ async function runJob($: EngineInterface, job: PiJob, input: DispatchInput): Pro
   }
   noteSkips(input.model ? chain : (cfg.pi.roles[job.role]?.models ?? []))
   if (input.model) {
-    // 点名的模型下架了或隐私开关不允许：不去调（下架的模型 opencode 只回一句 Unexpected server error）
+    // 点名的模型下架了：不去调（下架的模型 opencode 只回一句 Unexpected server error）
     if (oc.skip(input.model)) chain = []
   } else {
     const isDown = await pausedCheck($)
@@ -345,7 +340,7 @@ async function runChain(
           ? await $.process.run(await opencodeArgv($, model, readOnly, resolveCwd(input.cwd)), {
               // 2.x 没有 --dir，工作目录只靠 cwd
               cwd: resolveCwd(input.cwd),
-              env: { ...env, ...opencodeEnv(await opencodeHome($)) },
+              env: { ...env, ...(await ocEnv($)) },
               stdin: input.task,
               timeoutMs,
             })
@@ -378,7 +373,7 @@ async function runChain(
       break
     }
   }
-  if (models.length === 0) notes.push('没有可用的模型：角色链和兜底列表里的提供商都关掉了、在高峰、已暂停，或被隐私开关挡下')
+  if (models.length === 0) notes.push('没有可用的模型：角色链和兜底列表里的提供商都关掉了、在高峰、已暂停，或已下架')
   outputs.set(job.id, notes.join('\n'))
   // 失败的模型也可能改了一半
   const changes = root ? await gitChanges($, root) : undefined
@@ -417,7 +412,7 @@ async function startJob(
   // all：不看时段时能用的（角色链 + 兜底，去掉关掉的）；usable：此刻能用的
   const enabled = (m: string) => cfg.pi.providers[providerOf(m)]?.enabled !== false
   const all = input.model ? [input.model] : [...chainFor(cfg, role), ...cfg.pi.fallback.filter(enabled)]
-  const oc = await opencodeSkips($, cfg, role, resolveCwd(input.cwd), all)
+  const oc = await opencodeSkips($, all)
   const usable = input.model
     ? all.filter(m => !isPeak(cfg.pi.providers[providerOf(m)]?.peak, now))
     : liveChain(cfg, role, now, await pausedCheck($), oc.skip, await demoted($)).models
@@ -555,7 +550,7 @@ export const register: Register = on => {
       name: 'router_config',
       isDeferred: true,
       description:
-        "Read or change the auto-router config (which Claude model each kind of prompt gets, which delegate models each role tries in order — [pi] models and [opencode] free models —, providers on/off, peak hours, holidays, opencode.allowDirs for which directories may go to free models that log usage). Use it when the user asks to change routing in words. " +
+        "Read or change the auto-router config (which Claude model each kind of prompt gets, which delegate models each role tries in order — [pi] models and [opencode] free models —, providers on/off, peak hours, holidays).Use it when the user asks to change routing in words. " +
         "action=get returns the config JSON and the pi models available; action=set changes one value by a dotted path (e.g. path 'pi.roles.code.models', value ['openai/gpt-6.1-sol','openai/gpt-6.1-terra']; path 'pi.providers.openai.enabled', value false; path 'pi.providers.cc-switch-deep-seek.peak.holidays', value [...dates]); remove=true deletes the key; action=reset restores defaults with a .bak backup; action=report (optional days, default 7) returns the effect report: experiment arms, per-category turns/corrections/cost, pi jobs and guard counts; action=probe tries each way of classifying a prompt (classify, complete, fork) and reports which work and how long they take, for when routing seems stuck. " +
         'Every change is validated before it is saved; read first with get, and set whole arrays.',
       inputSchema: {
@@ -779,14 +774,13 @@ export const register: Register = on => {
       const plain: Config = {
         claude: { ...DEFAULT_CONFIG.claude, ...raw.claude },
         pi: { ...DEFAULT_CONFIG.pi, ...raw.pi },
-        opencode: { ...DEFAULT_CONFIG.opencode, ...raw.opencode },
         saver: { ...DEFAULT_CONFIG.saver, ...raw.saver },
         experiment: raw.experiment ?? DEFAULT_CONFIG.experiment,
         // 数据目录是本机的路径，不跟着别人的配置走
         dataDir: (await config($)).dataDir,
       }
-      // 0.2.x 导出的配置没有 opencode 段，按读配置时一样迁移
-      const merged = raw.pi && !raw.opencode ? migrateOpencode(plain).cfg : plain
+      // 0.2.x 导出的配置没有 opencode 提供商，按读配置时一样迁移
+      const merged = raw.pi && !raw.pi.providers?.opencode ? migrateOpencode(plain).cfg : plain
       const path = await configPath($, rt.isWindows)
       const old = await config($)
       const errs = await editConfig($, () => merged)

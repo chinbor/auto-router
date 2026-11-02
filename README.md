@@ -87,8 +87,6 @@ flowchart LR
 | `pi.pauseMinutes` | 30 | 鉴权或额度错误后整家暂停多久 |
 | `pi.guard.requireCleanGit` | true | 可写任务要求干净的 git 工作区 |
 | `pi.keepExtensions` | `["cc-safety-net"]` | 外派给 pi 时仍加载的扩展；其余扩展、MCP、技能一律不加载 |
-| `opencode.allowDirs` | `[]` | 允许把内容发给“会记录使用”的免费模型的目录；`["*"]` 表示哪里都行。有值时长文阅读（longctx）也只在这些目录里用 opencode |
-| `opencode.logged` | 见说明 | 官方说明里会记录使用或拿数据改进模型的免费模型 |
 
 默认的问题类别：
 
@@ -118,7 +116,6 @@ flowchart LR
 | trivial | 抽取字段、整理成 JSON | ✓ | oc-nemotron-lightning → agnes-2.5 → oc-beam |
 | 兜底 | 角色链都用不了时 | | agnes-3.0 → agnes-2.5 → oc-mimo → oc-flint |
 
-默认不允许任何目录用“会记录使用”的免费模型（MiMo、Flint、Big Pickle、Nemotron），所以 quick、trivial 的第一个、vision 的第二个和兜底里的 mimo、flint 默认会跳过，直到你在「外派模型」页的 opencode 一组里允许当前目录或全部目录。原因见 [架构说明](docs/architecture.md#opencode-通道)。
 
 ## 开发
 

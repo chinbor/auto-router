@@ -113,7 +113,7 @@ sequenceDiagram
 
 - `pi_dispatch` 工具的说明是根据当前配置生成的，列出每个角色和它依次尝试的模型，每个模型前标 `[pi]` 或 `[opencode]`。配置变了就重新注册。工具名沿用 `pi_dispatch`，不改名，以免已有的提示词和技能失效。
 - **通道**：模型名以 `opencode/` 开头的走 `opencode run`，其余走 pi（`channelOf`）。一条链里可以混着两条通道，按顺序试。结果头写成 `[opencode p1a2b3c4] 完成 · opencode/glm-5.3-flash-free`，任务记录、状态行（`🚀 opencode · 文本 · glm-5.3-flash-free 运行中`）和日志（`ch` 字段，旧记录按模型前缀推断）都带通道。
-- **模型链**：每个角色按"强 / 中 / 轻"档位排；同一档里按计费 免费 → 订阅 → 按量付费，再按 `pi.strengths`（擅长这个角色的在前，没标的居中，专长别的角色的在后）。跳过关掉的提供商、处在高峰时段的提供商、被熔断暂停的提供商、已下架或隐私开关不允许的免费模型；都用不了时用 `pi.fallback`；兜底也不行才排队到下一个空闲时段。
+- **模型链**：每个角色按"强 / 中 / 轻"档位排；同一档里按计费 免费 → 订阅 → 按量付费，再按 `pi.strengths`（擅长这个角色的在前，没标的居中，专长别的角色的在后）。跳过关掉的提供商、处在高峰时段的提供商、被熔断暂停的提供商、已下架的免费模型；都用不了时用 `pi.fallback`；兜底也不行才排队到下一个空闲时段。
 - **运行时兜底**（`runChain`）：角色链的模型依次试，一个失败换下一个；整条都失败后接着试 `pi.fallback` 里还没试过的。另外三条：
   - 一家超时后，同一任务不再试这家的其他模型；
   - 可写任务失败时如果工作区已经有改动，就停下来，不让下一个模型在半成品上接着改；
@@ -146,16 +146,8 @@ sequenceDiagram
   - 实测：只读代理的模型只看得到 glob、grep、read，没起任何 MCP，说不出全局规则的内容，读 `.env` 被拦；可写代理改文件、跑测试都正常，`git commit` 被拦。
   - 项目目录里的 opencode.json、AGENTS.md 照常生效，那是被派活的项目自己的；项目里配的 MCP 也会起，但 `"*": "deny"` 让模型调不到。
 - **下架**：免费模型随时可能下架。打开面板时和每个会话第一次派 opencode 时列一次模型（1.x 用 `opencode models opencode`，约 1.4 秒；2.x 用 `opencode models --standalone` 再挑 `opencode/` 开头的），不在列表里的模型派活时跳过并在结果里写一笔“已下架”；列表取不到（没装 opencode）时不按下架处理。
-- **隐私**：依据 [OpenCode Zen 文档](https://opencode.ai/docs/zen) 的隐私说明（2026-11-01 查）：
-
-  | 模型 | 官方说明 | 默认 |
-  |---|---|---|
-  | glm-5.3-flash-free、deepseek-v4.1-flash-free | 零保留，不拿来训练 | 哪里都能用 |
-  | beam-free | 不拿来训练，保留 30 天 | 哪里都能用 |
-  | big-pickle、mimo-v2.6-flash-free、flint-40b-free | 免费期间收集的数据可能用来改进模型（flint 保留 30 天） | 只在允许的目录 |
-  | nemotron-3.5-super-vl-free、nemotron-3.5-lightning-free | NVIDIA 试用端点：会记录，不要提交个人或机密数据 | 只在允许的目录 |
-
-  会记录的模型列在 `opencode.logged`。`opencode.allowDirs` 默认是 `[]`：会记录的模型哪个目录都不用，零保留的照常用。理由是派出去的任务常带着项目代码、日志和路径，默认不该发给会拿去改进模型的端点；而零保留的模型风险和按量付费的 API 相当，没必要拦。用户可以在「外派模型」页 opencode 一组里一键允许当前目录、全部目录（`["*"]`）或清空。`allowDirs` 有值（且不是 `*`）时说明用户在区分目录，这时长文阅读（longctx，整目录发出去）也只在允许的目录里用 opencode（`privacyBlock`）。
+- **数据政策**：免费模型的提供方可能保存内容或拿来改进模型（见 [OpenCode Zen 文档](https://opencode.ai/docs/zen)），新上的模型也不知道政策如何，插件不再按名单区分（已去掉 `opencode.allowDirs` / `opencode.logged` 和“会保存内容”标签）。不想把某个项目的内容发给免费模型时，在「外派模型」页把 opencode 这一家设成“不用”。
+- **你自己配的提供商**：隔离目录读不到全局 `opencode.json`，所以只把其中的 `provider` 一段经 `OPENCODE_CONFIG_CONTENT` 带过去（`userOcProviders`），magpie 这类中转和自加的 openai 兼容提供商因此能列出来、派得出去；MCP、插件照旧不带。
 - `OPENCODE_DISABLE_FREE_MODELS=1` 会让 opencode 不列免费模型；这时所有 opencode 模型都按“取不到列表”处理，派活时报错后换下一个。
 
 ### 旧配置迁移

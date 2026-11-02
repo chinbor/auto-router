@@ -360,6 +360,41 @@ export async function opencodeHome($: EngineInterface): Promise<string> {
   return (await configPath($, rt.isWindows)).replace(/auto-router\.json$/, `auto-router${sep()}opencode`)
 }
 
+let ocProviderCache: Promise<Record<string, unknown>> | undefined
+
+/** 用户全局 opencode 配置（opencode.json / .jsonc / config.json）里的 provider 一段；读不到、解析不了返回 {} */
+export function userOcProviders($: EngineInterface): Promise<Record<string, unknown>> {
+  ocProviderCache ??= (async () => {
+    const env = await userEnv($)
+    const home = (await configPath($, rt.isWindows)).replace(/[\\/]\.claude[\\/]auto-router\.json$/, '')
+    const dir = `${env.XDG_CONFIG_HOME || `${home}${sep()}.config`}${sep()}opencode`
+    for (const name of ['opencode.json', 'opencode.jsonc', 'config.json']) {
+      const text = await $.fs.read(`${dir}${sep()}${name}`).catch(() => undefined)
+      if (!text) continue
+      try {
+        return (JSON.parse(stripJsonc(text)) as { provider?: Record<string, unknown> }).provider ?? {}
+      } catch {
+        continue
+      }
+    }
+    return {}
+  })()
+  return ocProviderCache
+}
+
+/** 去掉 JSONC 的整行注释、块注释和结尾多余的逗号（不碰字符串里的 //，如网址） */
+export function stripJsonc(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/,(\s*[}\]])/g, '$1')
+}
+
+/** 外派给 opencode 时的环境变量：隔离目录，加上用户自己配的提供商 */
+export async function ocEnv($: EngineInterface): Promise<Record<string, string>> {
+  return opencodeEnv(await opencodeHome($), await userOcProviders($))
+}
+
 const OC_BASH_DENY = [
   'git commit*',
   'git push*',
@@ -384,7 +419,7 @@ const OC_READ = { '*': 'allow', '*.env': 'deny', '*.env.*': 'deny', '*.env.examp
  * - 用户配置里 bash 是 "ask" 时，opencode run 没人点允许会一直卡着，所以可写代理把 bash 明确设成 allow，
  *   只拦提交、推送和 reset（改动留给 Claude 审阅）
  */
-export function opencodeEnv(home: string): Record<string, string> {
+export function opencodeEnv(home: string, provider: Record<string, unknown> = {}): Record<string, string> {
   const base = { '*': 'deny', read: OC_READ, grep: 'allow', glob: 'allow', list: 'allow' }
   const agent = (description: string, permission: Record<string, unknown>) => ({ mode: 'primary', description, permission })
   return {
@@ -393,6 +428,8 @@ export function opencodeEnv(home: string): Record<string, string> {
     // 外派的任务里不自己升级：升级要下几百 MB，期间任务卡住，升级完旧路径也没了（实测）
     OPENCODE_DISABLE_AUTOUPDATE: '1',
     OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      // 用户全局配置里自己加的提供商（如 magpie 这类中转）：隔离目录读不到，单独带上；只带 provider 一段，MCP、插件照旧不带
+      ...(Object.keys(provider).length ? { provider } : {}),
       agent: {
         [OC_READONLY_AGENT]: agent('auto-router read-only: read, grep, glob, list only', base),
         [OC_WRITE_AGENT]: agent('auto-router write: edit and bash in the work dir, no commit or push', {
@@ -454,7 +491,7 @@ export async function probeModel($: EngineInterface, cfg: Config, model: string)
   const isOc = channelOf(model) === 'opencode'
   try {
     const argv = isOc ? await opencodeArgv($, model, true, home) : await piArgv($, model, true, cfg.pi.keepExtensions)
-    const env = { ...(await userEnv($)), ...(isOc ? opencodeEnv(home) : {}) }
+    const env = { ...(await userEnv($)), ...(isOc ? await ocEnv($) : {}) }
     const run = await $.process.run(argv, { cwd: home, env, stdin: 'Reply with the single word OK.', timeoutMs: 90_000 })
     const parsed: ReturnType<typeof parseOpencodeRun> = isOc ? parseOpencodeRun(run.stdout) : { text: run.stdout.trim() }
     const done = { ms: Date.now() - t0, at: Date.now() }
@@ -471,7 +508,7 @@ export async function probeModel($: EngineInterface, cfg: Config, model: string)
 export async function refreshOpencodeModels($: EngineInterface): Promise<string[]> {
   // 列出全部提供商：opencode 自己的免费模型，加上你在 opencode 里配的其他家
   const args = (await opencodeMajor($)) < 2 ? ['models'] : ['models', '--standalone']
-  const run = await $.process.run(await opencodeCommand($, args), { env: { ...(await userEnv($)), ...opencodeEnv(await opencodeHome($)) }, timeoutMs: 120_000 }).catch(() => undefined)
+  const run = await $.process.run(await opencodeCommand($, args), { env: { ...(await userEnv($)), ...(await ocEnv($)) }, timeoutMs: 120_000 }).catch(() => undefined)
   const list = run && run.exitCode === 0 ? parseOpencodeModels(run.stdout) : []
   if (list.length) await update($, ocModels, () => list)
   return list

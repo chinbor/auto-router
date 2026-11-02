@@ -1,13 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { buildRoles, channelOf, DEFAULT_CONFIG, liveChain, migrateOpencode, ocModelArg, parseOpencodeModels, privacyBlock, tagged } from '../hooks/config'
-import { describeTool, parseOpencodeRun, parseShim } from '../hooks/core'
+import { buildRoles, channelOf, DEFAULT_CONFIG, liveChain, migrateOpencode, ocModelArg, parseOpencodeModels, tagged } from '../hooks/config'
+import { describeTool, opencodeEnv, parseOpencodeRun, parseShim, stripJsonc } from '../hooks/core'
 import { channelOfRecord, summarize } from '../hooks/stats'
 import { piStatus } from '../hooks/statusline'
 import type { Config } from '../hooks/config'
 
-// opencode 通道：分流、只读限制、免费排序、下架跳过、隐私开关、旧配置迁移、通道标签
+// opencode 通道：分流、只读限制、免费排序、下架跳过、旧配置迁移、通道标签
 
 type On = Parameters<TestBody>[1]
 type Run = { exitCode: number; stdout: string; stderr: string }
@@ -34,7 +34,7 @@ const events = (text: string) =>
     .map(e => JSON.stringify(e))
     .join('\n')
 
-function ocConfig(roles: Config['pi']['roles'], over: Partial<Config['opencode']> = {}, fallback: string[] = []): Config {
+function ocConfig(roles: Config['pi']['roles'], fallback: string[] = []): Config {
   return {
     ...DEFAULT_CONFIG,
     claude: { ...DEFAULT_CONFIG.claude, categories: DEFAULT_CONFIG.claude.categories.map(({ piRole: _r, ...c }) => c) },
@@ -45,7 +45,6 @@ function ocConfig(roles: Config['pi']['roles'], over: Partial<Config['opencode']
       roles,
       fallback,
     },
-    opencode: { ...DEFAULT_CONFIG.opencode, ...over },
   }
 }
 
@@ -237,13 +236,6 @@ test('点名一个已下架的免费模型：不去调，直接说明', async ($
   expect(out).toContain('opencode/jev-1.13-free: 跳过（opencode 里已经没有这个模型')
 })
 
-test('兜底里被隐私开关挡下的模型：没用到兜底时不记', async ($, on) => {
-  const cfg = ocConfig({ text: { description: 't', models: [GLM], readOnly: true } }, {}, [MIMO])
-  host(on, cfg)
-  await start($)
-  expect(await dispatch($, { task: '总结', role: 'text' })).not.toContain(MIMO)
-})
-
 test('opencode 没装（取不到模型列表）时不按下架处理', async ($, on) => {
   const cfg = ocConfig({ text: { description: 't', models: [GLM, AG3], readOnly: true } })
   const { calls } = host(on, cfg, { ocList: [] })
@@ -322,14 +314,15 @@ test('面板“测一下”：每个模型发一句，标出能不能用；额�
   await ui.unmount()
 })
 
-test('角色链运行时都失败了：接着试兜底，兜底里被挡下的这时才记', async ($, on) => {
-  const cfg = ocConfig({ text: { description: 't', models: [GLM], readOnly: true } }, {}, [MIMO, AG3])
+test('角色链运行时都失败了：接着试兜底，兜底里已下架的这时才记', async ($, on) => {
+  const GONE = 'opencode/gone-free'
+  const cfg = ocConfig({ text: { description: 't', models: [GLM], readOnly: true } }, [GONE, AG3])
   const { calls } = host(on, cfg, { oc: () => ({ exitCode: 1, stdout: '', stderr: 'Unexpected server error' }) })
   await start($)
   const out = await dispatch($, { task: '总结', role: 'text' })
   expect(calls.map(modelOf)).toEqual([GLM, AG3])
   expect(out).toContain(`text 的模型都没成功，接着试兜底 ${AG3}`)
-  expect(out).toContain(`${MIMO}: 跳过`)
+  expect(out).toContain(`${GONE}: 跳过`)
   expect(out).toContain(`完成 · ${AG3}`)
 })
 
@@ -343,7 +336,7 @@ test('超时：同一家后面的模型不再等，换别家', async ($, on) => 
 })
 
 test('可写任务失败时已经改了文件：不再换模型，交回去检查', async ($, on) => {
-  const cfg = ocConfig({ code: { description: 'c', models: [GLM, AG3] } }, {}, [AG25])
+  const cfg = ocConfig({ code: { description: 'c', models: [GLM, AG3] } }, [AG25])
   const { calls } = host(on, cfg, { dirtyAfterRun: true, oc: () => ({ exitCode: 1, stdout: '', stderr: 'boom' }) })
   await start($)
   const out = await dispatch($, { task: '改代码', role: 'code' })
@@ -390,43 +383,8 @@ test('opencode 的工具输出里碰巧有 "api key" 也不熔断：普通失败
   expect(calls.map(modelOf)).toEqual([GLM, OC_DS])
 })
 
-test('隐私开关：会记录使用的模型只在允许的目录里用；allowDirs 有值时长文阅读也只在这些目录里用 opencode', () => {
-  const none = DEFAULT_CONFIG
-  expect(privacyBlock(none, MIMO, 'quick', 'D:\\work', true)).toContain('allowDirs')
-  expect(privacyBlock(none, GLM, 'text', 'D:\\work', true)).toBeUndefined()
-  expect(privacyBlock(none, OC_DS, 'longctx', 'D:\\work', true)).toBeUndefined()
-  expect(privacyBlock(none, AG3, 'quick', 'D:\\work', true)).toBeUndefined()
-
-  const pub: Config = { ...DEFAULT_CONFIG, opencode: { ...DEFAULT_CONFIG.opencode, allowDirs: ['D:\\Public\\'] } }
-  expect(privacyBlock(pub, MIMO, 'quick', 'd:/public/repo', true)).toBeUndefined()
-  expect(privacyBlock(pub, MIMO, 'quick', 'D:\\PublicX', true)).toContain('allowDirs')
-  expect(privacyBlock(pub, OC_DS, 'longctx', 'D:\\work', true)).toContain('长文阅读')
-  expect(privacyBlock(pub, OC_DS, 'longctx', 'D:\\Public\\big', true)).toBeUndefined()
-  expect(privacyBlock(pub, OC_DS, 'review', 'D:\\work', true)).toBeUndefined()
-
-  const all: Config = { ...DEFAULT_CONFIG, opencode: { ...DEFAULT_CONFIG.opencode, allowDirs: ['*'] } }
-  expect(privacyBlock(all, MIMO, 'quick', 'D:\\work', true)).toBeUndefined()
-})
-
-test('隐私开关：派活时跳过不允许的模型并记一笔；目录允许后照常用', async ($, on) => {
-  const roles = { quick: { description: 'q', models: [MIMO, AG3], readOnly: true } }
-  const blocked = host(on, ocConfig(roles))
-  await start($)
-  const out = await dispatch($, { task: '看日志', role: 'quick' })
-  expect(blocked.calls.map(modelOf)).toEqual([AG3])
-  expect(out).toContain('opencode.allowDirs')
-})
-
-test('隐私开关：目录在允许列表里时用会记录使用的模型', async ($, on) => {
-  const roles = { quick: { description: 'q', models: [MIMO, AG3], readOnly: true } }
-  const ok = host(on, ocConfig(roles, { allowDirs: ['D:\\work'] }))
-  await start($)
-  await dispatch($, { task: '看日志', role: 'quick' })
-  expect(ok.calls.map(modelOf)).toEqual([MIMO])
-})
-
 test('liveChain：skip 拦下的模型去掉，主链空了用兜底', () => {
-  const cfg = ocConfig({ quick: { description: 'q', models: [MIMO] } }, {}, [AG3])
+  const cfg = ocConfig({ quick: { description: 'q', models: [MIMO] } }, [AG3])
   expect(liveChain(cfg, 'quick', 0, () => false, m => m === MIMO)).toEqual({ models: [AG3], isFallback: true })
 })
 
@@ -553,8 +511,8 @@ test('通道标签：工具说明、状态行、日志记录都写明 pi 还是 
   expect(rec?.ch).toBe('opencode')
 })
 
-test('外派模型页：标签改名，模型旁标通道，opencode 一组带隐私开关', async ($, on) => {
-  const { writes } = host(on, DEFAULT_CONFIG)
+test('外派模型页：标签改名，模型旁标通道，不再标“会保存内容”', async ($, on) => {
+  host(on, DEFAULT_CONFIG)
   await start($)
   const ui = await $.ui.mount({
     plugin: 'auto-router',
@@ -572,22 +530,29 @@ test('外派模型页：标签改名，模型旁标通道，opencode 一组带�
   expect(await ui.find({ type: 'Text', text: /pi 通道/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /opencode 通道/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'bill-opencode-free' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /提供方会保存内容/ })).toBeDefined()
-  writes.length = 0
-  await ui.press({ key: 'privacy-here' })
-  const last = () => writes.filter(w => w.path.endsWith('auto-router.json')).pop()
-  for (let i = 0; i < 50 && !last(); i++) await ui.findAll({})
-  expect((JSON.parse(last()?.text ?? '{}') as Config).opencode.allowDirs).toEqual(['D:\\work'])
+  expect(await ui.find({ type: 'Text', text: /会保存内容/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('opencode 里配的其他提供商：记成 oc:提供商/模型，走 opencode，派活时去掉前缀；隐私开关只管免费模型', () => {
+test('opencode 里配的其他提供商：记成 oc:提供商/模型，走 opencode，派活时去掉前缀', () => {
   const list = parseOpencodeModels(['opencode/glm-5.3-flash-free', 'alibaba/qwen3-max', 'zai/glm-5', 'not a model'].join('\n'))
   expect(list).toEqual(['opencode/glm-5.3-flash-free', 'oc:alibaba/qwen3-max', 'oc:zai/glm-5'])
   expect(channelOf('oc:alibaba/qwen3-max')).toBe('opencode')
   expect(ocModelArg('oc:alibaba/qwen3-max')).toBe('alibaba/qwen3-max')
   expect(ocModelArg('opencode/glm-5.3-flash-free')).toBe('opencode/glm-5.3-flash-free')
   expect(channelOfRecord({ model: 'oc:zai/glm-5' })).toBe('opencode')
-  const cfg = { ...DEFAULT_CONFIG, opencode: { ...DEFAULT_CONFIG.opencode, allowDirs: [], logged: ['oc:zai/glm-5'] } }
-  expect(privacyBlock(cfg, 'oc:zai/glm-5', 'longctx', 'D:\work', true)).toBeUndefined()
+})
+
+test('隔离目录读不到用户自己配的提供商：只把 provider 一段带进 OPENCODE_CONFIG_CONTENT，代理照旧', async () => {
+  const provider = { magpie: { npm: '@ai-sdk/openai-compatible', options: { baseURL: 'https://example.test/v1' }, models: { 'gpt-6.1-sol': {} } } }
+  const cfg = JSON.parse(opencodeEnv('H', provider).OPENCODE_CONFIG_CONTENT as string)
+  expect(cfg.provider).toEqual(provider)
+  expect(Object.keys(cfg.agent).length).toBe(2)
+  expect(cfg.mcp).toBeUndefined()
+  expect(JSON.parse(opencodeEnv('H').OPENCODE_CONFIG_CONTENT as string).provider).toBeUndefined()
+})
+
+test('解析 opencode.jsonc：去掉注释和结尾逗号，网址里的 // 不动', async () => {
+  const text = ['{', '  // 注释', '  /* 块 */ "provider": { "magpie": { "options": { "baseURL": "https://x.test/v1", }, }, },', '}'].join('\n')
+  expect(JSON.parse(stripJsonc(text)).provider.magpie.options.baseURL).toBe('https://x.test/v1')
 })

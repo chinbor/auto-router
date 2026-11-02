@@ -103,16 +103,6 @@ export type Config = {
      */
     keepExtensions: string[]
   }
-  /** opencode 通道的隐私设置（免费模型的数据政策见 docs/architecture.md） */
-  opencode: {
-    /**
-     * 允许发给 opencode 免费模型的目录。[] 表示不限目录，但 logged 里的模型一律不用；
-     * 有值时 logged 里的模型只在这些目录里用，长文阅读（longctx）也只在这些目录里用 opencode；"*" 表示全部允许
-     */
-    allowDirs: string[]
-    /** 官方说明里会记录使用或拿数据改进模型的免费模型 */
-    logged: string[]
-  }
   saver: {
     /** 总开关：关掉后不拦、不提醒、不写规则，scout / executor 子代理也不出现 */
     enabled: boolean
@@ -146,7 +136,6 @@ const OC_FLINT = 'opencode/flint-40b-free'
 const OC_VL = 'opencode/nemotron-3.5-super-vl-free'
 const OC_LIGHT = 'opencode/nemotron-3.5-lightning-free'
 const OC_BEAM = 'opencode/beam-free'
-const OC_PICKLE = 'opencode/big-pickle'
 
 // 原则：同一档里 免费 → 订阅 → 按量付费。opencode 免费模型兜底或打头，gpt、agnes 订阅留给重要的活，
 // 按量付费的 deepseek 尽量靠后，且只在空闲时段用。deepseek-v4-pro 比 flash 贵，默认不用。
@@ -258,9 +247,6 @@ export const DEFAULT_CONFIG: Config = {
     // 只拦危险命令的安全扩展，装了就留着
     keepExtensions: ['cc-safety-net'],
   },
-  // 据 opencode.ai/docs/zen（2026-11 核实）：glm-5.3-flash-free、deepseek-v4.1-flash-free 零留存、不训练；
-  // beam-free 不训练、留存 30 天；big-pickle、flint、mimo 免费期数据可能用于改进模型；nemotron 走 NVIDIA 试用端点，记录使用、要求不传私密数据
-  opencode: { allowDirs: [], logged: [OC_PICKLE, OC_FLINT, OC_MIMO, OC_VL, OC_LIGHT] },
   saver: {
     enabled: true,
     guard: true,
@@ -328,12 +314,11 @@ export async function loadConfig($: EngineInterface, isWindows: boolean): Promis
     const merged: Config = {
       claude: { ...DEFAULT_CONFIG.claude, ...claude },
       pi: { ...DEFAULT_CONFIG.pi, ...raw.pi },
-      opencode: { ...DEFAULT_CONFIG.opencode, ...raw.opencode },
       saver: { ...DEFAULT_CONFIG.saver, ...raw.saver, ...oldRemind(raw.saver?.remindAt) },
       experiment: raw.experiment ?? (legacyAb ? 'route' : DEFAULT_CONFIG.experiment),
       dataDir: raw.dataDir ?? DEFAULT_CONFIG.dataDir,
     }
-    const { cfg, note } = raw.pi && !raw.opencode ? migrateOpencode(merged) : { cfg: merged, note: undefined }
+    const { cfg, note } = raw.pi && !raw.pi.providers?.opencode ? migrateOpencode(merged) : { cfg: merged, note: undefined }
     const errs = validate(cfg)
     if (errs.length) throw new Error(errs.slice(0, 3).join('；'))
     warned = false
@@ -369,7 +354,7 @@ const LEGACY_FALLBACK = [AG3, AG25]
  * 用户已经有的提供商、档位不动。角色还是旧默认时按新档位重排，手调过的不动，只提示一句。
  */
 export function migrateOpencode(cfg: Config): { cfg: Config; note?: string } {
-  if (cfg.pi.providers.opencode) return { cfg: { ...cfg, opencode: { ...DEFAULT_CONFIG.opencode, ...cfg.opencode } } }
+  if (cfg.pi.providers.opencode) return { cfg }
   const ocTiers = Object.fromEntries(Object.entries(DEFAULT_CONFIG.pi.tiers).filter(([m]) => channelOf(m) === 'opencode'))
   const next: Config = {
     ...cfg,
@@ -379,7 +364,6 @@ export function migrateOpencode(cfg: Config): { cfg: Config; note?: string } {
       tiers: { ...cfg.pi.tiers, ...ocTiers },
       strengths: { ...DEFAULT_CONFIG.pi.strengths, ...cfg.pi.strengths },
     },
-    opencode: { ...DEFAULT_CONFIG.opencode },
   }
   const untouched =
     JSON.stringify(cfg.pi.fallback) === JSON.stringify(LEGACY_FALLBACK) &&
@@ -438,9 +422,6 @@ export function validate(cfg: Config): string[] {
   for (const [m, list] of Object.entries(cfg.pi?.strengths ?? {})) {
     if (!Array.isArray(list) || !list.every(r => typeof r === 'string')) errs.push(`pi.strengths 里「${m}」要是角色名列表`)
   }
-  const oc = cfg.opencode
-  if (!Array.isArray(oc?.allowDirs) || !oc.allowDirs.every(d => typeof d === 'string' && d.trim())) errs.push('opencode.allowDirs 要是目录列表，可以为空 []')
-  if (!Array.isArray(oc?.logged) || !oc.logged.every(m => typeof m === 'string')) errs.push('opencode.logged 要是模型列表，可以为空 []')
   for (const [name, p] of Object.entries(providers)) {
     if (typeof p?.enabled !== 'boolean') errs.push(`pi.providers.${name}.enabled 要是 true / false`)
     if (!BILLINGS.includes(p?.billing)) errs.push(`pi.providers.${name}.billing 只能是 ${BILLINGS.join(' / ')}`)
@@ -592,32 +573,6 @@ export function parseOpencodeModels(stdout: string): string[] {
     .map(l => (l.startsWith('opencode/') ? l : `${OC_PREFIX}${l}`))
 }
 
-function normDir(dir: string, isWindows: boolean): string {
-  const d = dir.replace(/\\/g, '/').replace(/\/+$/, '')
-  return isWindows ? d.toLowerCase() : d
-}
-
-function inside(dir: string, parent: string, isWindows: boolean): boolean {
-  const a = normDir(dir, isWindows)
-  const b = normDir(parent, isWindows)
-  return a === b || a.startsWith(`${b}/`)
-}
-
-/**
- * 隐私开关：这个任务能不能发给这个 opencode 模型；不能时返回原因。
- * logged 里的模型只在 allowDirs 里的目录用；allowDirs 有值时，长文阅读也只在这些目录里用 opencode。
- */
-export function privacyBlock(cfg: Config, model: string, role: string, cwd: string, isWindows: boolean): string | undefined {
-  // 只管 opencode 自己的免费模型；oc: 开头的是你自己账号下的提供商
-  if (providerOf(model) !== 'opencode') return undefined
-  const dirs = cfg.opencode.allowDirs
-  const allowed = dirs.includes('*') || dirs.some(d => inside(cwd, d, isWindows))
-  if (allowed) return undefined
-  if (cfg.opencode.logged.includes(model)) return '官方说明里这个免费模型会记录使用或拿数据改进模型，目录不在 opencode.allowDirs 里'
-  if (role === 'longctx' && dirs.length > 0) return '长文阅读要整目录发出去，目录不在 opencode.allowDirs 里'
-  return undefined
-}
-
 function minutes(hhmm: string): number {
   const [h, m] = hhmm.split(':').map(Number)
   return (h ?? 0) * 60 + (m ?? 0)
@@ -655,7 +610,7 @@ export function chainFor(config: Config, role: string, now?: number): string[] {
 }
 
 /**
- * 此刻真正要试的模型：角色链去掉关掉、高峰、熔断（isDown）、被 skip 拦下（隐私开关、已下架）的；
+ * 此刻真正要试的模型：角色链去掉关掉、高峰、熔断（isDown）、被 skip 拦下（已下架）的；
  * 一个都不剩时改用兜底列表（同样过滤），isFallback 标出来
  */
 export function liveChain(

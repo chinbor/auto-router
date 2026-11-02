@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { ModelMode, ModelRefresh, SettingsTab } from '../types'
-import { atLeast, buildRoles, CLAUDE_ALIASES, channelOf, claudeModelsFrom, isPeak, privacyBlock, providerOf, say, setPath } from './config'
+import { atLeast, buildRoles, CLAUDE_ALIASES, channelOf, claudeModelsFrom, isPeak, providerOf, say, setPath } from './config'
 import type { Billing, Config, Tier } from './config'
 import { costSplit, delegateStats, demotedModels, experimentReport, modelVersions, redoStats, summarize, verdict, versionLabel } from './stats'
 import { categoryIcon, modelTag } from './statusline'
@@ -27,13 +27,18 @@ const setupOpen = atom({ plugin: 'auto-router', key: 'setupOpen' } as const, nul
 const rebuildAsk = atom({ plugin: 'auto-router', key: 'rebuildAsk' } as const, false)
 const probe = atom({ plugin: 'auto-router', key: 'probe' } as const, {}, { shape: 'probe-1' })
 const refresh = atom({ plugin: 'auto-router', key: 'refresh' } as const, null as ModelRefresh | null, { shape: 'refresh-1' })
+/** 上次在面板里刷新时看到的模型清单，跨会话记在 store 里：新会话的清单是空的，只和本会话比会永远是“和上次一样” */
+const SEEN = 'seenModels'
+type Seen = { pi: string[]; oc: string[] }
+
 /**
- * 重新读 pi --list-models 和 opencode models，记下比上次多了、少了哪些。
- * 某条命令这次没取到（没装、失败）时，那边不算增减，免得把整家当成“都下架了”。
+ * 重新读 pi --list-models 和 opencode models，记下比上次刷新时多了、少了哪些。
+ * 某条命令这次没取到（没装、失败）时，那边不算增减，也不覆盖上次的清单，免得把整家当成“都下架了”。
  */
 async function refreshModels($: EngineInterface): Promise<void> {
   if ((await read($, refresh))?.running) return
-  const [pi0, oc0] = [await read($, piModels), await read($, ocModels)]
+  const seen = (await $.store.get(SEEN).catch(() => undefined)) as Seen | undefined
+  const [pi0, oc0] = [seen?.pi ?? (await read($, piModels)), seen?.oc ?? (await read($, ocModels))]
   await update($, refresh, r => ({ at: r?.at ?? 0, added: r?.added ?? [], removed: r?.removed ?? [], running: true }))
   const [pi1, oc1] = await Promise.all([refreshPiModels($), refreshOpencodeModels($)])
   const diff = (before: string[], after: string[]) =>
@@ -41,6 +46,7 @@ async function refreshModels($: EngineInterface): Promise<void> {
       ? { added: [], removed: [] }
       : { added: after.filter(m => !before.includes(m)), removed: before.filter(m => !after.includes(m)) }
   const [a, b] = [diff(pi0, pi1), diff(oc0, oc1)]
+  await $.store.set(SEEN, { pi: pi1.length ? pi1 : pi0, oc: oc1.length ? oc1 : oc0 } satisfies Seen).catch(() => undefined)
   await update($, refresh, () => ({ at: Date.now(), added: [...a.added, ...b.added], removed: [...a.removed, ...b.removed] }))
 }
 
@@ -535,11 +541,10 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     const gone = (m: string) => channelOf(m) === 'opencode' && ocKnown.length > 0 && !ocKnown.includes(m)
     // pi 已经列出模型清单时，不在清单里的就是没装或没配 key
     const missing = (m: string) => channelOf(m) === 'pi' && known.length > 0 && !known.includes(m)
-    const blocked = (m: string, role: string) => privacyBlock(cfg, m, role, rt.sessionCwd, rt.isWindows)
     // 额度用完的模型在派活顺序里只标 ⏸，什么时候恢复在 ③ 顶部合成一条写
     const QUOTA = '额度用完'
     // 此刻不用这个模型的原因；null 表示能用
-    const whyNot = (m: string, role: string): string | null => {
+    const whyNot = (m: string): string | null => {
       const p = cfg.pi.providers[providerOf(m)]
       if (p?.enabled === false) return '已关'
       if (missing(m)) return '没检测到'
@@ -547,7 +552,6 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
       if ((pausedMap[providerOf(m)]?.until ?? 0) > now) return '暂停'
       if ((pausedMap[m]?.until ?? 0) > now) return QUOTA
       if (gone(m)) return '已下架'
-      if (blocked(m, role)) return '隐私'
       return null
     }
     // 改计费方式或档位后，按档位重排各角色的模型
@@ -645,11 +649,6 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             已下架
           </Text>
         )}
-        {cfg.opencode.logged.includes(m) && (
-          <Text color="yellow" size="footnote">
-            会保存内容
-          </Text>
-        )}
       </Box>
     )
     // 一家：上面一行选付费方式，下面列出它的全部模型选档位。没启用的只显示一行；模型太多时没选档位的先收起
@@ -707,34 +706,6 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
       )
     }
 
-    // 隐私开关：哪些目录的内容可以发给会保存内容的免费模型（一个下拉框）
-    const dirs = cfg.opencode.allowDirs
-    const here = rt.sessionCwd
-    const ocUsed = cfg.pi.providers.opencode?.enabled === true
-    const privacyValue = dirs.includes('*') ? 'all' : dirs.length === 0 ? 'none' : dirs.length === 1 && dirs[0] === here ? 'here' : 'some'
-    const privacy = (
-      <Box flexDirection="column" marginTop={1}>
-        <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
-          <Text>标黄的模型（提供方会保存内容）</Text>
-          {choice({
-            key: 'privacy',
-            value: privacyValue,
-            options: [
-              { value: 'none', label: '不用' },
-              { value: 'here', label: '只在当前目录用' },
-              ...(privacyValue === 'some' ? [{ value: 'some', label: `只在 ${dirs.length} 个目录用` }] : []),
-              { value: 'all', label: '所有目录都用' },
-            ],
-            onSelect: v => {
-              if (v === 'some') return
-              const next = v === 'all' ? ['*'] : v === 'here' ? [here] : []
-              edit(c => setPath(c, 'opencode.allowDirs', next))()
-            },
-          })}
-        </Box>
-      </Box>
-    )
-
     const roles = Object.entries(cfg.pi.roles)
     // “测一下”：派活顺序和兜底里用到的模型，各发一句“回复 OK”，4 个一起跑
     const toProbe = [...new Set([...roles.flatMap(([, r]) => r.models), ...cfg.pi.fallback])].filter(
@@ -784,7 +755,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
 
     // 每类活一行：此刻会用的绿色加粗；此刻跳过的变灰，后面一个小字原因；能用的后面标测试结果
     const chain = (name: string, ms: string[], readOnly?: boolean) => {
-      const firstLive = ms.find(m => !whyNot(m, name))
+      const firstLive = ms.find(m => !whyNot(m))
       return (
         <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" marginBottom={1}>
           <Box width={14} flexShrink={0} flexDirection="row" gap={1}>
@@ -796,7 +767,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
             )}
           </Box>
           {ms.map((m, i) => {
-            const why = whyNot(m, name)
+            const why = whyNot(m)
             return (
               <Box flexDirection="row" gap={1} alignItems="center">
                 {i > 0 && <Text dimColor>›</Text>}
@@ -834,7 +805,7 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
     // 概览：在用几家、几个模型定了档位、几类活此刻有模型可派
     const usedProvs = [...piProvs, ...ocProvs].filter(isOn).length
     const tieredCount = Object.keys(tiers).filter(m => !missing(m) && !gone(m)).length
-    const liveRoles = roles.filter(([name, r]) => r.models.some(m => !whyNot(m, name))).length
+    const liveRoles = roles.filter(([, r]) => r.models.some(m => !whyNot(m))).length
     body = (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap" marginBottom={1}>
@@ -893,7 +864,6 @@ export async function renderPane($: EngineInterface, e: PaneEvent) {
               </Box>
             )}
             {channelBody('oc', ocProvs, ['opencode'])}
-            {ocUsed && privacy}
           </Box>,
           'blue',
           '免费模型，和你在 opencode 里配的各家',
