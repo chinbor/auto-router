@@ -46,7 +46,7 @@ export const COLD_NAME: Record<NonNullable<RouterDecision['cold']>, string> = { 
 export function modelTag(model: string): string {
   const key = Object.keys(MODEL_NAME).find(k => model.toLowerCase().includes(k))
   if (!key) return model
-  const v = model.startsWith('claude-') ? /-(\d+)-(\d+)$/.exec(model) : null
+  const v = model.startsWith('claude-') ? /-(\d+)-(\d+)(?:\[[^\]]*\])?$/.exec(model) : null
   return `${MODEL_DOT[key]} ${MODEL_NAME[key]}${v ? ` ${v[1]}.${v[2]}` : ''}`
 }
 
@@ -79,6 +79,22 @@ export function routeStatus(
     parts.push(rank(model) > rank(opts.prevModel) ? `⬆ 自 ${modelTag(opts.prevModel)}` : `⬇ 自 ${modelTag(opts.prevModel)}`)
   }
   if (opts.showPi && d.piRole) parts.push(`🚀 可外派（${ROLE_NAME[d.piRole] ?? d.piRole}）`)
+  return parts.join(SEP)
+}
+
+/**
+ * 这一轮没定下模型时的状态行：实际模型照常显示，并写明为什么没换。
+ * 不显示的话，分类一直失败时用户既看不到提示，也不知道模型其实没在切换
+ */
+export function unroutedStatus(d: RouterDecision | null, actualModel: string, opts: { showPi: boolean }): string {
+  const parts = [modelTag(actualModel)]
+  const known = d && d.label !== '沿用' && !d.cf
+  if (known) parts.push(`${CATEGORY_ICON[d.label] ?? '▫'} ${d.label}`)
+  if (d?.cf === 'timeout') parts.push('⚠ 分类超时，模型不变')
+  else if (d?.cf === 'error') parts.push(/429|rate_limit/.test(d.cerr ?? '') ? '⚠ 分类被限流，模型不变' : '⚠ 分类出错，模型不变')
+  else if (d?.cf) parts.push('⚠ 没分出类别，模型不变')
+  else parts.push('🔒 还没定模型，沿用当前模型')
+  if (opts.showPi && d?.piRole) parts.push(`🚀 可外派（${ROLE_NAME[d.piRole] ?? d.piRole}）`)
   return parts.join(SEP)
 }
 

@@ -6,6 +6,7 @@ import type { Config } from '../hooks/config'
 import { coldReason, pickByNumber } from '../hooks/classify'
 import { ruleLabel } from '../hooks/rules'
 import { imageDims } from '../hooks/saver'
+import { modelTag, unroutedStatus } from '../hooks/statusline'
 import { categoryStats, categoryText, cellStats, costSplit, costSplitText, delegateStats, delegateText, summarize, configVersion, demotedModels, modelVersions, overlap, redoStats, redoText, sessionArms, sessionStats, taskWords, versionLabel } from '../hooks/stats'
 import type { LogRecord } from '../hooks/stats'
 
@@ -927,4 +928,23 @@ test('外派提示统计：提示几轮、真派几轮、没提示也派了几�
   expect(text).toContain('提示了 3 轮，当轮真派了 1 轮（33%）；没提示也派了 1 轮')
   expect(text).toContain('review 1/2')
   expect(delegateText(delegateStats([t(1, {})], 0))).toBe('')
+})
+
+// ---------- 状态行：没定下模型时也要有提示 ----------
+
+test('没定下模型时状态行写明实际模型和原因', () => {
+  const o = { showPi: true }
+  const base = { label: '分类出错', lighterStreak: 0 } as never as Parameters<typeof unroutedStatus>[0] & object
+  expect(modelTag('claude-opus-5-5[1m]')).toBe('🟣 Opus 5.5')
+  expect(unroutedStatus({ ...base, cf: 'error', cerr: RATE_LIMITED }, 'claude-opus-5-5', o)).toContain('⚠ 分类被限流，模型不变')
+  expect(unroutedStatus({ ...base, cf: 'error', cerr: 'boom' }, 'claude-opus-5-5', o)).toContain('⚠ 分类出错，模型不变')
+  expect(unroutedStatus({ ...base, cf: 'timeout' }, 'claude-opus-5-5', o)).toContain('⚠ 分类超时，模型不变')
+  expect(unroutedStatus({ ...base, cf: 'none' }, 'claude-opus-5-5', o)).toContain('⚠ 没分出类别，模型不变')
+  expect(unroutedStatus({ ...base, label: '沿用' }, 'claude-opus-5-5', o)).toContain('🔒 还没定模型')
+  expect(unroutedStatus(null, 'claude-sonnet-5-5', o)).toContain('Sonnet 5.5')
+  const hit = unroutedStatus({ ...base, label: '难题/设计', piRole: 'review' }, 'claude-opus-5-5[1m]', o)
+  expect(hit).toContain('Opus 5.5')
+  expect(hit).toContain('难题/设计')
+  expect(hit).toContain('🚀 可外派')
+  expect(unroutedStatus({ ...base, label: '难题/设计', piRole: 'review' }, 'claude-opus-5-5', { showPi: false })).not.toContain('🚀')
 })

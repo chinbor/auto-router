@@ -29,7 +29,7 @@ import { demotedModels, experimentReport, family, overlap, redoStats, REDO_OVERL
 import { doctor, effectReport, reportVersion, weeklyHelp, writeReport } from './report'
 import { coldReason, decide, probeClassifier } from './classify'
 import { renderPane } from './panel'
-import { piStatus, routeStatus } from './statusline'
+import { piStatus, routeStatus, unroutedStatus } from './statusline'
 import {
   armLabel,
   armOf,
@@ -585,7 +585,11 @@ export const register: Register = on => {
       return yield* next(e)
     }
     const model = decision?.model
-    if (!decision || !model || !/claude|opus|sonnet|haiku|fable/i.test(e.model)) return yield* next(e)
+    const isClaude = /claude|opus|sonnet|haiku|fable/i.test(e.model)
+    if (!decision || !model || !isClaude) {
+      if (e.index === 0 && isClaude) $.ui.status(unroutedStatus(decision, e.model, { showPi: await read($, piAuto) }))
+      return yield* next(e)
+    }
     if (e.index === 0) {
       const cfg = await config($)
       $.ui.status(routeStatus(decision, { prevModel: lastMainModel, downgradeAfter: cfg.claude.downgradeAfter, showPi: await read($, piAuto) }))
